@@ -1,10 +1,13 @@
 /*
-  ESP32-S3 LFR: QTR-8A + TB6612FNG + HC-05/HC-06 UART
+  ESP32-S3 LFR: QTR-8A + TB6612FNG + built-in BLE (Nordic UART Service)
   Arduino-ESP32 core 3.x | Board: ESP32S3 Dev Module | USB CDC On Boot: Enabled
+  No HC-05/HC-06 needed. BLE name: "ESP32-S3 Line Follower".
+    Service 6E400001-..., RX 6E400002-... (phone writes), TX 6E400003-... (notify)
 
-  - First boot (or invalid NVS calibration): 2 s stationary on WHITE,
-    then 5 s sweeping all 8 sensors over the BLACK line.
-  - Valid calibration is saved in NVS and reused at the next boot.
+  - Power-on: 2 s stationary on WHITE, then 5 s sweeping all 8 sensors
+    over the BLACK line (set CALIBRATE_EVERY_BOOT=false to reuse the
+    calibration saved in NVS instead).
+  - Valid calibration is saved in NVS.
   - PID tuning is saved in NVS 2 s after the last changed parameter;
     STOP also saves pending PID changes immediately.
   - Press BOOT (GPIO0) to stop immediately; hold for 2 s AFTER boot,
@@ -13,7 +16,7 @@
   - START/STOP emit checksummed status replies so the
     unchanged phone app shows the actual ESP32 run state, not just a request.
   - START includes an adjustable 180 ms motor breakaway pulse. Test wheels up.
-  - UART at 9600 baud: incoming commands are ALWAYS 2 binary bytes.
+  - BLE: incoming commands are ALWAYS 2 binary bytes.
       [1,value] Kp numerator    [2,value] Kp decimal divider (0..4)
       [3,value] Ki numerator    [4,value] Ki decimal divider (0..4)
       [5,value] Kd numerator    [6,value] Kd decimal divider (0..4)
@@ -26,15 +29,17 @@
     [10,1] Heartbeat while running, every 600 ms; timeout 2500 ms.
     [11,1] Enable framed telemetry for 4 s (refresh periodically)
     [11,0] Disable telemetry; [12,0] Read white/black calibration arrays.
+    [13,value] Base speed % (0..100)   [14,value] Max speed % (0..100)
     Frame: A5 5A type length seq payload CRC8(poly=07 over type..payload).
-    Type 51: status (8 payload bytes: six PID fields, flags, reserved).
+    Type 51: status (10 payload bytes: six PID fields, flags, reserved,
+             base speed %, max speed %).
     Type 52: eight QTR intensities + position (u16) + flags + signed PWM L/R.
     Type 53: stored white and black ADC raw readings (32 bytes).
     Replies: 0x06 ACK, 0x15 NAK, 0xC1 calibration success,
              0xC0 calibration failed, 0xC2 stored calibration loaded,
              0xD1 motor safety timeout.
-    The old app's 2-byte command format is unchanged for commands 1..7.
-    If the old app expects text responses, adapt its receive handler.
+    The 2-byte command format is unchanged for commands 1..7.
+    All replies are binary (never text) so the app can verify them.
 
   IMPORTANT ELECTRICAL REQUIREMENTS:
     - QTR-8A analog outputs MUST stay within the ESP32-S3 input range.
@@ -48,15 +53,26 @@
 #include <Preferences.h>
 #include <stddef.h>   // offsetof
 #include <math.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// Arduino auto-generates function prototypes near the top of the sketch;
+// declare the record types early so those prototypes compile.
+struct CalibrationRecord;
+struct PIDRecord;
+struct SpeedRecord;
 
 // ---------------- User options ----------------
 const bool WAIT_FOR_APP = true;
+const bool CALIBRATE_EVERY_BOOT = true; // false = reuse NVS calibration at boot
 const int RGB_LED_PIN = 48;              // use 38 for official DevKitC-1 v1.1
-// 25/30% was often too weak to overcome motor static friction.
-// Start with the wheels raised, then tune these for your motors and track.
-const int BASE_SPEED = 45;              // percent of full PWM in PID mode
-const int MAX_SPEED  = 65;              // maximum magnitude of either motor
-const int START_PULSE_SPEED = 60;       // short straight startup pulse, percent
+// Default speeds (percent of full PWM). The app can change them (commands
+// 13/14); the app's values are saved in NVS and used after the next boot.
+const int DEFAULT_BASE_SPEED = 25;      // forward speed in PID mode
+const int DEFAULT_MAX_SPEED  = 30;      // maximum magnitude of either motor
+// START gives a short straight pulse at MAX speed to overcome static friction.
 const uint32_t START_PULSE_MS = 180;    // disable by setting to 0
 const uint32_t PID_SAVE_DELAY_MS = 2000;
 const uint32_t CONTROL_PERIOD_US = 5000;
@@ -73,17 +89,122 @@ const int MIN_CAL_RANGE = 300;          // raw 12-bit ADC counts
 const int AIN1 = 42, AIN2 = 41, PWMA = 21; // left motor
 const int BIN1 = 40, BIN2 = 39, PWMB = 47; // right motor
 const int QTR[8] = {7, 15, 16, 17, 18, 8, 9, 10};
-const int BT_TX_PIN = 43;               // ESP TX -> HC-05 RX
-const int BT_RX_PIN = 44;               // ESP RX <- HC-05 TX
 const int USER_BOOT_GPIO  = 0;                // hold after startup to recalibrate
 
-const int BASE_PWM = BASE_SPEED * 255 / 100;
-const int MAX_PWM = MAX_SPEED * 255 / 100;
-const int START_PULSE_PWM = START_PULSE_SPEED * 255 / 100;
-// The HC-06 is wired to GPIO43/44, which are native UART0 pins.
-// USB CDC On Boot must be ENABLED, so Serial stays on the USB port.
-// Using Serial0 avoids remapping UART1 onto UART0's default pins.
-HardwareSerial &BT = Serial0;
+// ---------------- BLE Nordic UART transport ----------------
+// Replaces the HC-05/HC-06 UART. It offers the same available/peek/read/write
+// calls the protocol code below uses, so the app protocol is unchanged.
+#define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  // phone -> ESP32 (write)
+#define NUS_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  // ESP32 -> phone (notify)
+const char *BLE_DEVICE_NAME = "ESP32-S3 Line Follower";
+
+portMUX_TYPE bleRxMux = portMUX_INITIALIZER_UNLOCKED;
+
+class BleUart {
+ public:
+  void begin(const char *name);
+
+  int available() {
+    portENTER_CRITICAL(&bleRxMux);
+    int n = (int)((head + RX_SIZE - tail) % RX_SIZE);
+    portEXIT_CRITICAL(&bleRxMux);
+    return n;
+  }
+  int peek() {
+    int b = -1;
+    portENTER_CRITICAL(&bleRxMux);
+    if (head != tail) b = rx[tail];
+    portEXIT_CRITICAL(&bleRxMux);
+    return b;
+  }
+  int read() {
+    int b = -1;
+    portENTER_CRITICAL(&bleRxMux);
+    if (head != tail) { b = rx[tail]; tail = (tail + 1) % RX_SIZE; }
+    portEXIT_CRITICAL(&bleRxMux);
+    return b;
+  }
+
+  size_t write(uint8_t b) { return write(&b, 1); }
+  // Sends binary bytes as TX notifications. 20-byte chunks fit even the
+  // smallest BLE MTU; the app reassembles frames split across notifications.
+  size_t write(const uint8_t *data, size_t len) {
+    if (!connected || tx == nullptr) return 0;
+    for (size_t at = 0; at < len; at += 20) {
+      size_t n = (len - at < 20) ? (len - at) : 20;
+      tx->setValue((uint8_t *)(data + at), n);
+      tx->notify();
+    }
+    return len;
+  }
+
+  // Called from the BLE task when the phone writes to RX.
+  void received(const uint8_t *data, size_t len) {
+    portENTER_CRITICAL(&bleRxMux);
+    for (size_t i = 0; i < len; ++i) {
+      size_t next = (head + 1) % RX_SIZE;
+      if (next == tail) break;  // buffer full: drop the rest
+      rx[head] = data[i];
+      head = next;
+    }
+    portEXIT_CRITICAL(&bleRxMux);
+  }
+  void linkUp() { connected = true; }
+  void linkDown() {
+    connected = false;
+    portENTER_CRITICAL(&bleRxMux);
+    head = 0;                   // discard any half-received command
+    tail = 0;
+    portEXIT_CRITICAL(&bleRxMux);
+    dropped = true;
+  }
+  bool takeLinkDropped() { bool d = dropped; dropped = false; return d; }
+
+  BLECharacteristic *tx = nullptr;
+
+ private:
+  static const size_t RX_SIZE = 512;
+  uint8_t rx[RX_SIZE];
+  volatile size_t head = 0, tail = 0;
+  volatile bool connected = false, dropped = false;
+};
+
+BleUart BT;
+
+class NusRxCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    // getData/getLength keep 0x00 bytes (e.g. STOP = 07 00) intact.
+    BT.received(c->getData(), c->getLength());
+  }
+};
+
+class NusServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *s) override { BT.linkUp(); }
+  void onDisconnect(BLEServer *s) override {
+    BT.linkDown();
+    BLEDevice::startAdvertising();  // otherwise the phone cannot reconnect
+  }
+};
+
+void BleUart::begin(const char *name) {
+  BLEDevice::init(name);
+  BLEDevice::setMTU(247);
+  BLEServer *server = BLEDevice::createServer();
+  server->setCallbacks(new NusServerCallbacks());
+  BLEService *service = server->createService(NUS_SERVICE_UUID);
+  tx = service->createCharacteristic(NUS_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  tx->addDescriptor(new BLE2902());
+  BLECharacteristic *rxChar = service->createCharacteristic(
+      NUS_RX_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  rxChar->setCallbacks(new NusRxCallbacks());
+  service->start();
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(NUS_SERVICE_UUID);
+  adv->setScanResponse(true);   // device name goes in the scan response
+  BLEDevice::startAdvertising();
+}
+
 Preferences prefs;
 bool prefsReady = false;
 
@@ -126,10 +247,17 @@ uint32_t lastTelemetryLeaseMs = 0;
 uint32_t lastTelemetryMs = 0;
 uint8_t frameSequence = 0;
 int lastMotorLeft = 0, lastMotorRight = 0;
+int baseSpeed = DEFAULT_BASE_SPEED;     // percent, set from app (cmd 13)
+int maxSpeed = DEFAULT_MAX_SPEED;       // percent, set from app (cmd 14)
+
+int maxPwm() { return maxSpeed * 255 / 100; }
+// Base can never exceed max, otherwise PID could not steer.
+int basePwm() { return min(baseSpeed, maxSpeed) * 255 / 100; }
 
 // ---------------- NVS blob definitions ----------------
 const uint32_t CAL_MAGIC = 0x4C465243;  // 'LFRC'
 const uint32_t PID_MAGIC = 0x4C465250;  // 'LFRP'
+const uint32_t SPD_MAGIC = 0x4C465253;  // 'LFRS'
 const uint16_t STORAGE_VERSION = 1;
 
 struct CalibrationRecord {
@@ -147,6 +275,13 @@ struct PIDRecord {
   uint8_t kpVal, kpDiv;
   uint8_t kiVal, kiDiv;
   uint8_t kdVal, kdDiv;
+  uint32_t checksum;
+};
+
+struct SpeedRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint8_t baseSpeed, maxSpeed;
   uint32_t checksum;
 };
 
@@ -187,8 +322,35 @@ bool loadPID() {
   return true;
 }
 
+bool loadSpeed() {
+  if (!prefsReady || prefs.getBytesLength("spd") != sizeof(SpeedRecord))
+    return false;
+  SpeedRecord r = {};
+  if (prefs.getBytes("spd", &r, sizeof(r)) != sizeof(r)) return false;
+  if (r.magic != SPD_MAGIC || r.version != STORAGE_VERSION) return false;
+  if (r.checksum != checksum32(&r, offsetof(SpeedRecord, checksum)))
+    return false;
+  if (r.baseSpeed > 100 || r.maxSpeed > 100) return false;
+  baseSpeed = r.baseSpeed;
+  maxSpeed = r.maxSpeed;
+  return true;
+}
+
+bool saveSpeed() {
+  if (!prefsReady) return false;
+  SpeedRecord r = {};
+  r.magic = SPD_MAGIC;
+  r.version = STORAGE_VERSION;
+  r.baseSpeed = (uint8_t)baseSpeed;
+  r.maxSpeed = (uint8_t)maxSpeed;
+  r.checksum = checksum32(&r, offsetof(SpeedRecord, checksum));
+  return prefs.putBytes("spd", &r, sizeof(r)) == sizeof(r);
+}
+
+// Saves PID and speed settings (both change through the same "dirty" flag).
 bool savePID() {
   if (!prefsReady) return false;
+  saveSpeed();
 
   PIDRecord r = {};
   r.magic = PID_MAGIC;
@@ -374,9 +536,11 @@ void sendStatusFrame() {
   for (int i = 1; i <= 7; i++) crc ^= frame[i];
   frame[8] = crc;
   if (telemetryEnabled) {
-    uint8_t p[8];
+    uint8_t p[10];
     for (int i = 0; i < 7; ++i) p[i] = frame[i+1];
     p[7] = 0; // reserved for future protocol versions
+    p[8] = (uint8_t)baseSpeed;
+    p[9] = (uint8_t)maxSpeed;
     sendFramed(PKT_STATUS, p, sizeof(p));
   } else BT.write(frame, sizeof(frame));
 }
@@ -386,7 +550,7 @@ void sendStatusFrame() {
 void readBluetooth() {
   while (BT.available() >= 2) {
     int cmd = BT.peek();
-    if (cmd < 1 || cmd > 12) {
+    if (cmd < 1 || cmd > 14) {
       BT.read();  // skip invalid leading byte
       continue;
     }
@@ -399,8 +563,19 @@ void readBluetooth() {
         (cmd == 9 && val != 0) ||
         (cmd == 10 && val != 1) ||
         (cmd == 11 && val > 1) ||
-        (cmd == 12 && val != 0)) {
+        (cmd == 12 && val != 0) ||
+        ((cmd == 13 || cmd == 14) && val > 100)) {
       BT.write(NAK);
+      continue;
+    }
+
+    if (cmd == 13 || cmd == 14) {
+      if (cmd == 13) baseSpeed = val;
+      else maxSpeed = val;
+      pidDirty = true;                 // saved to NVS together with PID
+      lastPIDChangeMs = millis();
+      BT.write(ACK);
+      Serial.printf("Speed: base %d%%  max %d%%\n", baseSpeed, maxSpeed);
       continue;
     }
 
@@ -456,12 +631,12 @@ void readBluetooth() {
         // Drive both motors immediately, before the first QTR PID sample.
         // Gives low-speed motors an initial kick against static friction.
         if (startPulseActive) {
-          setMotors(START_PULSE_PWM, START_PULSE_PWM);
+          setMotors(maxPwm(), maxPwm());
         }
         BT.write(ACK);
         sendStatusFrame(); // App already parses this: confirms START accepted.
         Serial.printf("BT START accepted: startup PWM=%d/%d, PID base=%d max=%d\n",
-                      START_PULSE_PWM, 255, BASE_PWM, MAX_PWM);
+                      maxPwm(), 255, basePwm(), maxPwm());
       } else {
         BT.write(NAK);
         sendStatusFrame(); // Revert app's optimistic RUNNING UI to actual state.
@@ -594,9 +769,8 @@ void setup() {
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
   Serial.begin(115200);
-  BT.setRxBufferSize(512);  // default size, made explicit
-  BT.begin(9600, SERIAL_8N1, BT_RX_PIN, BT_TX_PIN);
-  Serial.println("HC-06 opened on UART0 GPIO44/RX and GPIO43/TX at 9600 baud");
+  BT.begin(BLE_DEVICE_NAME);
+  Serial.printf("BLE advertising as \"%s\" (Nordic UART Service)\n", BLE_DEVICE_NAME);
 
   prefsReady = prefs.begin("lfr", false);
   if (!prefsReady) Serial.println("WARNING: NVS unavailable; settings won't persist");
@@ -614,14 +788,16 @@ void setup() {
     savePID();
   }
   Serial.printf("Kp %.4f Ki %.4f Kd %.4f\n", Kp, Ki, Kd);
+  if (loadSpeed()) Serial.println("Stored speed loaded from NVS");
+  Serial.printf("Speed: base %d%%  max %d%%\n", baseSpeed, maxSpeed);
 
-  if (loadCalibration()) {
+  if (!CALIBRATE_EVERY_BOOT && loadCalibration()) {
     calOk = true;
     showLED(0, 40, 0);
     Serial.println("Stored calibration loaded; skipping 7 s calibration");
     BT.write(CAL_LOADED);
   } else {
-    Serial.println("No valid saved calibration; calibrating now");
+    Serial.println("Calibrating now: 2 s on WHITE, then 5 s sweep over the line");
     performCalibration();
   }
 
@@ -635,6 +811,15 @@ void setup() {
 }
 
 void loop() {
+  if (BT.takeLinkDropped()) {
+    telemetryEnabled = false;
+    if (REQUIRE_APP_HEARTBEAT && robotOn) {
+      stopRobot();
+      Serial.println("Safety stop: BLE connection lost");
+    } else {
+      Serial.println("BLE connection lost; advertising again");
+    }
+  }
   readBluetooth();
   checkBootButton();
   sendSensorFrameIfDue();
@@ -712,6 +897,8 @@ void loop() {
   lastError = error;
   pidLast = true;
 
+  const int MAX_PWM = maxPwm();    // speeds can change live from the app
+  const int BASE_PWM = basePwm();
   correction = constrain(correction, (float)(-2 * MAX_PWM),
                          (float)(2 * MAX_PWM));
   int left = BASE_PWM + (int)correction;

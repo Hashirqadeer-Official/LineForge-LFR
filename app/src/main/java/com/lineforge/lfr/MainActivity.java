@@ -92,6 +92,7 @@ public final class MainActivity extends Activity {
     private Button connectButton, startButton, stopButton;
     private Switch liveSwitch;
     private PidControl kp, ki, kd;
+    private SpeedControl speed;
     private int sentBytes = 0, receivedBytes = 0;
     private String lastEvent = "Ready to pair";
     private final Runnable heartbeatTask = new Runnable() {
@@ -327,6 +328,10 @@ public final class MainActivity extends Activity {
         content.addView(uploadButtons);
         content.addView(gap(20));
 
+        speed = new SpeedControl();
+        content.addView(speed.view, full());
+        content.addView(gap(17));
+
         LinearLayout calCard = card();
         calCard.addView(txt("SENSOR CALIBRATION", 13, TEXT, true));
         calCard.addView(gap(7));
@@ -528,16 +533,92 @@ public final class MainActivity extends Activity {
         }
     }
 
+    /** Motor speed (% of full PWM): command 13 = base speed, 14 = max speed. */
+    private final class SpeedControl {
+        final LinearLayout view = card();
+        private SeekBar baseBar, maxBar;
+        private final TextView baseLabel, maxLabel;
+
+        SpeedControl() {
+            LinearLayout head = row();
+            head.addView(txt("MOTOR SPEED", 13, TEXT, true), weighted());
+            head.addView(txt("% of full power", 11, MUTED, false));
+            view.addView(head);
+            view.addView(gap(12));
+            baseLabel = txt("", 13, TEXT, true);
+            maxLabel = txt("", 13, TEXT, true);
+            baseBar = slider(ORANGE);
+            maxBar = slider(RED);
+            view.addView(baseLabel);
+            view.addView(baseBar, full());
+            view.addView(gap(10));
+            view.addView(maxLabel);
+            view.addView(maxBar, full());
+            view.addView(gap(8));
+            view.addView(txt("Sent when you release a slider. START gives a 180 ms kick at max speed.", 11, MUTED, false));
+            setData(preferences.getInt("speed_base", 25), preferences.getInt("speed_max", 30));
+        }
+
+        private SeekBar slider(int color) {
+            SeekBar s = new SeekBar(MainActivity.this);
+            s.setMax(100);
+            s.setProgressTintList(ColorStateList.valueOf(color));
+            s.setThumbTintList(ColorStateList.valueOf(color));
+            s.setProgressBackgroundTintList(ColorStateList.valueOf(BORDER));
+            s.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                @Override public void onStartTrackingTouch(SeekBar sb) { }
+                @Override public void onProgressChanged(SeekBar sb, int v, boolean fromUser) {
+                    if (!fromUser) return;
+                    // Base speed can never be above max speed.
+                    if (sb == baseBar && v > maxBar.getProgress()) maxBar.setProgress(v);
+                    if (sb == maxBar && v < baseBar.getProgress()) baseBar.setProgress(v);
+                    updateLabels();
+                }
+                @Override public void onStopTrackingTouch(SeekBar sb) {
+                    saveLocal();
+                    send(true);
+                }
+            });
+            return s;
+        }
+
+        int base() { return baseBar.getProgress(); }
+        int max() { return maxBar.getProgress(); }
+
+        void setData(int base, int max) {
+            int m = Math.min(100, Math.max(0, max));
+            maxBar.setProgress(m);
+            baseBar.setProgress(Math.min(m, Math.max(0, base)));
+            updateLabels();
+        }
+
+        void updateLabels() {
+            baseLabel.setText("Base speed   " + base() + "%");
+            maxLabel.setText("Max speed   " + max() + "%");
+        }
+
+        void saveLocal() {
+            preferences.edit().putInt("speed_base", base()).putInt("speed_max", max()).apply();
+        }
+
+        void send(boolean log) {
+            if (!connected) return;
+            sendBytes(new byte[]{13, (byte)base(), 14, (byte)max()}, true);
+            if (log) addEvent("Speed sent: base " + base() + "%, max " + max() + "%.");
+        }
+    }
+
     private void uploadAll() {
         if (!connected) { showToast("Connect your ESP32 first"); return; }
         blurInputs();
         byte[] values = new byte[]{
                 1, (byte)kp.value(), 2, (byte)kp.divisor(),
                 3, (byte)ki.value(), 4, (byte)ki.divisor(),
-                5, (byte)kd.value(), 6, (byte)kd.divisor()};
-        kp.saveLocal(); ki.saveLocal(); kd.saveLocal();
+                5, (byte)kd.value(), 6, (byte)kd.divisor(),
+                13, (byte)speed.base(), 14, (byte)speed.max()};
+        kp.saveLocal(); ki.saveLocal(); kd.saveLocal(); speed.saveLocal();
         sendBytes(values, true);
-        addEvent("Sent six PID settings (12 bytes). NVS will save after 2 s.");
+        addEvent("Sent PID + speed settings (16 bytes). NVS will save after 2 s.");
     }
 
     private void blurInputs() {
@@ -898,7 +979,7 @@ public final class MainActivity extends Activity {
     }
 
     private void receivePacket(int type, byte[] payload) {
-        if (type == Protocol.STATUS && payload.length == 8) {
+        if (type == Protocol.STATUS && payload.length >= 8) {
             receiveStateFrame(payload, true);
         } else if (type == Protocol.SENSORS && payload.length == 13) {
             int[] samples = new int[8];
@@ -933,7 +1014,7 @@ public final class MainActivity extends Activity {
     }
 
     private void receiveStateFrame(byte[] data, boolean framed) {
-        if (data.length != 8) return;
+        if (data.length < 8) return;
         if (!framed) {
             int checksum = 0;
             for (int i = 0; i < 7; ++i) checksum ^= (data[i] & 255);
@@ -947,6 +1028,11 @@ public final class MainActivity extends Activity {
         ki.setData(data[2] & 255,kid);
         kd.setData(data[4] & 255,kdd);
         kp.saveLocal(); ki.saveLocal(); kd.saveLocal();
+        // Framed status from the BLE firmware also carries base/max speed %.
+        if (framed && data.length >= 10 && speed != null) {
+            int base = data[8] & 255, max = data[9] & 255;
+            if (base <= 100 && max <= 100) { speed.setData(base, max); speed.saveLocal(); }
+        }
         calibrationValid=(flags & 1)!=0;
         boolean wasPending=startPending;
         running=(flags & 2)!=0;
