@@ -6,10 +6,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
-import android.bluetooth.BluetoothManager;
-import android.bluetooth.BluetoothSocket;
 import android.content.ActivityNotFoundException;
-import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -17,6 +14,7 @@ import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.location.LocationManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -42,23 +40,16 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * LineForge LFR: a no-third-party-dependencies Bluetooth Classic SPP controller.
+ * LineForge LFR: a no-third-party-dependencies Bluetooth Low Energy controller
+ * for the ESP32-S3's built-in BLE, using the Nordic UART Service (see BleUartClient).
  * Protocol: two-byte binary commands; compatible with ESP32S3_LFR_BT_NVS.
  * The accompanying firmware extension adds [9,0] status query and [10,1] heartbeat.
  */
@@ -74,16 +65,14 @@ public final class MainActivity extends Activity {
     private static final int PURPLE = Color.rgb(177, 136, 255);
     private static final int RED = Color.rgb(255, 98, 111);
     private static final int ORANGE = Color.rgb(255, 196, 100);
-    private static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     private static final int REQ_CONNECT = 151;
+    private static final long SCAN_DURATION_MS = 12000;
     private static final String PREFS_NAME = "lineforge_ui";
 
     private final Handler ui = new Handler(Looper.getMainLooper());
-    private final ExecutorService writer = Executors.newSingleThreadExecutor();
     private final AtomicInteger session = new AtomicInteger();
-    private final Object outputLock = new Object();
-    private volatile BluetoothSocket socket;
-    private volatile OutputStream socketOut;
+    private BleUartClient ble;
+    private Protocol.Parser parser;
     private volatile boolean connected = false;
     private boolean running = false;
     private boolean startPending = false;
@@ -122,9 +111,10 @@ public final class MainActivity extends Activity {
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
         preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        ble = new BleUartClient(this, bleCallback);
         createInterface();
         ui.postDelayed(heartbeatTask, 600);
-        addEvent("Pair HC-06 in Android Bluetooth settings, then select it here.");
+        addEvent("Power the ESP32-S3, then tap Scan to find it over BLE. No pairing needed.");
     }
 
     @Override protected void onStop() {
@@ -140,8 +130,8 @@ public final class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         ui.removeCallbacks(heartbeatTask);
-        disconnectSocket();
-        writer.shutdownNow();
+        ble.stopScan();
+        disconnectLink();
         super.onDestroy();
     }
 
@@ -254,17 +244,19 @@ public final class MainActivity extends Activity {
         connectionLabel = txt("OFFLINE", 12, RED, true);
         connectionLabel.setPadding(dp(9), 0, 0, 0);
         deviceHeader.addView(connectionLabel, weighted());
-        TextView protocol = txt("BT CLASSIC  •  SPP", 10, MUTED, true);
+        TextView protocol = txt("BLE  •  NORDIC UART", 10, MUTED, true);
         deviceHeader.addView(protocol);
         deviceCard.addView(deviceHeader);
         deviceCard.addView(gap(13));
-        selectedDevice = txt("No Bluetooth module connected", 16, TEXT, true);
+        selectedDevice = txt("No ESP32 connected", 16, TEXT, true);
         deviceCard.addView(selectedDevice);
         deviceCard.addView(gap(14));
-        connectButton = button("Select paired HC-06", MINT, BG);
+        connectButton = button("Scan for ESP32 (BLE)", MINT, BG);
         connectButton.setOnClickListener(v -> {
-            if (connected) disconnectSocket();
-            else ensureBluetoothPermission();
+            if (connected || ble.isActive()) {
+                disconnectLink();
+                addEvent("Disconnected by user.");
+            } else ensureBluetoothPermission();
         });
         deviceCard.addView(connectButton, full());
         content.addView(deviceCard, full());
@@ -353,7 +345,7 @@ public final class MainActivity extends Activity {
         consoleHead.addView(sendCountLabel);
         console.addView(consoleHead);
         console.addView(gap(12));
-        eventLog = txt("Waiting for HC-06…", 12, MUTED, false);
+        eventLog = txt("Waiting for ESP32…", 12, MUTED, false);
         eventLog.setLineSpacing(dp(5), 1.0f);
         console.addView(eventLog);
         console.addView(gap(8));
@@ -361,7 +353,7 @@ public final class MainActivity extends Activity {
         console.addView(linkInfo);
         content.addView(console, full());
         content.addView(gap(14));
-        TextView foot = txt("Protocol v3  •  CRC8 telemetry  •  9600 baud", 11, MUTED, false);
+        TextView foot = txt("Protocol v3  •  CRC8 telemetry  •  BLE NUS", 11, MUTED, false);
         foot.setGravity(Gravity.CENTER);
         content.addView(foot);
 
@@ -537,7 +529,7 @@ public final class MainActivity extends Activity {
     }
 
     private void uploadAll() {
-        if (!connected) { showToast("Connect your HC-06 first"); return; }
+        if (!connected) { showToast("Connect your ESP32 first"); return; }
         blurInputs();
         byte[] values = new byte[]{
                 1, (byte)kp.value(), 2, (byte)kp.divisor(),
@@ -558,7 +550,7 @@ public final class MainActivity extends Activity {
     }
 
     private void startRobot() {
-        if (!connected) { showToast("Connect HC-06 first"); return; }
+        if (!connected) { showToast("Connect ESP32 first"); return; }
         if (queryReceived && !calibrationValid) {
             showToast("Calibrate QTR-8A before starting"); return;
         }
@@ -575,7 +567,7 @@ public final class MainActivity extends Activity {
                 // Do not assume the robot stopped just because its reply was lost.
                 // Explicit STOP as well as the firmware heartbeat timeout.
                 sendBytes(new byte[]{7, 0}, false);
-                addEvent("NO START CONFIRMATION: STOP sent. Check UART, power and firmware.");
+                addEvent("NO START CONFIRMATION: STOP sent. Check BLE link, power and firmware.");
             }
         }, 2500);
     }
@@ -600,7 +592,7 @@ public final class MainActivity extends Activity {
     }
 
     private void confirmCalibration() {
-        if (!connected) { showToast("Connect the HC-06 first"); return; }
+        if (!connected) { showToast("Connect the ESP32 first"); return; }
         new AlertDialog.Builder(this)
                 .setTitle("Recalibrate QTR-8A?")
                 .setMessage("Place the robot on WHITE before proceeding. Once started, leave it still for 2 seconds, then sweep all 8 sensors across the black line for 5 seconds. The motors will stay stopped. Successful values are saved to NVS.")
@@ -615,86 +607,160 @@ public final class MainActivity extends Activity {
     }
 
     private void requestRobotState() {
-        if (!connected) { showToast("Connect the HC-06 first"); return; }
+        if (!connected) { showToast("Connect the ESP32 first"); return; }
         queryReceived = false;
         sendBytes(new byte[]{9, 0}, true);
         addEvent("Requesting actual PID values from the ESP32…");
         ui.postDelayed(() -> {
             if (connected && !queryReceived)
-                addEvent("No verified ESP32 status: check HC-06 UART at 9600, power/GND, RX/TX and possible motor-triggered resets.");
+                addEvent("No verified ESP32 status: check that the firmware feeds NUS RX writes to its command parser and replies via TX notify; also check power and motor-triggered resets.");
         }, 2300);
     }
 
     private void requestCalibrationData(boolean showDialog) {
-        if (!connected) { showToast("Connect HC-06 first"); return; }
+        if (!connected) { showToast("Connect ESP32 first"); return; }
         calibrationDialogPending = showDialog;
         sendBytes(new byte[]{12, 0}, true);
         if (showDialog) addEvent("Requesting eight saved white/black calibration pairs…");
     }
 
-    private boolean hasConnectPermission() {
-        return Build.VERSION.SDK_INT < 31 ||
-                checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
+    // ------------------------------------------------------------ BLE permissions
+
+    private String[] blePermissions() {
+        if (Build.VERSION.SDK_INT >= 31)
+            return new String[]{Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT};
+        // Android 11 and older only return BLE scan results with location permission.
+        return new String[]{Manifest.permission.ACCESS_FINE_LOCATION};
+    }
+
+    private boolean hasBlePermissions() {
+        for (String p : blePermissions())
+            if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) return false;
+        return true;
     }
 
     private void ensureBluetoothPermission() {
-        if (!hasConnectPermission()) {
-            requestPermissions(new String[]{Manifest.permission.BLUETOOTH_CONNECT}, REQ_CONNECT);
+        if (!hasBlePermissions()) {
+            requestPermissions(blePermissions(), REQ_CONNECT);
             return;
         }
-        choosePairedDevice();
+        scanForDevices();
     }
 
     @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
         if (requestCode == REQ_CONNECT) {
-            if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) choosePairedDevice();
-            else addEvent("Nearby devices permission is required to connect to HC-06.");
+            boolean granted = results.length > 0;
+            for (int r : results) granted &= r == PackageManager.PERMISSION_GRANTED;
+            if (granted) scanForDevices();
+            else addEvent(Build.VERSION.SDK_INT >= 31
+                    ? "Nearby devices permission is required to scan for and connect to the ESP32."
+                    : "Location permission is required by Android to scan for BLE devices.");
         }
     }
 
-    @SuppressLint("MissingPermission")
-    private void choosePairedDevice() {
-        if (!hasConnectPermission()) return;
-        BluetoothManager manager = (BluetoothManager)getSystemService(Context.BLUETOOTH_SERVICE);
-        BluetoothAdapter adapter = manager == null ? null : manager.getAdapter();
-        if (adapter == null) { showToast("This phone does not support Bluetooth"); return; }
+    private boolean locationServicesOn() {
+        LocationManager lm = (LocationManager)getSystemService(LOCATION_SERVICE);
+        if (lm == null) return true;
+        if (Build.VERSION.SDK_INT >= 28) return lm.isLocationEnabled();
+        return lm.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
+                lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
+    }
+
+    // ----------------------------------------------------------- BLE device scan
+
+    private static final class ScanEntry {
+        final BluetoothDevice device;
+        String name;
+        int rssi;
+        boolean nus;
+        ScanEntry(BluetoothDevice device) { this.device = device; }
+        @Override public String toString() {
+            return (name == null ? "Unnamed BLE device" : name) + (nus ? "   •  UART service" : "") +
+                    "\n" + device.getAddress() + "   " + rssi + " dBm";
+        }
+    }
+
+    private void scanForDevices() {
+        if (!hasBlePermissions()) return;
+        BluetoothAdapter adapter = ble.adapter();
+        if (adapter == null || !getPackageManager().hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)) {
+            showToast("This phone does not support Bluetooth Low Energy"); return;
+        }
         if (!adapter.isEnabled()) {
             new AlertDialog.Builder(this).setTitle("Bluetooth is off")
-                    .setMessage("Turn on Bluetooth and pair the HC-06 in your phone settings first.")
+                    .setMessage("Turn on Bluetooth to find the ESP32-S3.")
                     .setNegativeButton("Cancel", null)
-                    .setPositiveButton("Bluetooth settings", (d, w) -> openBluetoothSettings())
+                    .setPositiveButton("Turn on", (d, w) -> requestBluetoothOn())
                     .show();
             return;
         }
-        Set<BluetoothDevice> bonded = adapter.getBondedDevices();
-        if (bonded == null || bonded.isEmpty()) {
-            new AlertDialog.Builder(this).setTitle("No paired devices")
-                    .setMessage("Open Android Bluetooth settings and pair with HC-06 (commonly PIN 1234 or 0000). Then return and tap Connect.")
+        if (Build.VERSION.SDK_INT < 31 && !locationServicesOn()) {
+            new AlertDialog.Builder(this).setTitle("Location is off")
+                    .setMessage("On Android 11 and older, BLE scanning only finds devices while Location is switched on.")
                     .setNegativeButton("Cancel", null)
-                    .setPositiveButton("Open settings", (d, w) -> openBluetoothSettings()).show();
+                    .setPositiveButton("Location settings", (d, w) -> {
+                        try { startActivity(new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)); }
+                        catch (ActivityNotFoundException e) { showToast("Enable Location in Android settings"); }
+                    }).show();
             return;
         }
-        List<BluetoothDevice> devices = new ArrayList<>(bonded);
-        Collections.sort(devices, (a, b) -> {
-            String x = a.getName() == null ? "" : a.getName();
-            String y = b.getName() == null ? "" : b.getName();
-            boolean ax = x.toLowerCase(Locale.ROOT).contains("hc-");
-            boolean by = y.toLowerCase(Locale.ROOT).contains("hc-");
-            if (ax != by) return ax ? -1 : 1;
-            return x.compareToIgnoreCase(y);
-        });
-        String[] labels = new String[devices.size()];
-        for (int i = 0; i < devices.size(); i++) {
-            BluetoothDevice d = devices.get(i);
-            labels[i] = (d.getName() == null ? "Unnamed Bluetooth device" : d.getName()) + "\n" + d.getAddress();
-        }
-        new AlertDialog.Builder(this)
-                .setTitle("Choose your paired HC-06")
-                .setItems(labels, (dialog, which) -> connectDevice(devices.get(which)))
-                .setNeutralButton("Pair new device", (dialog, which) -> openBluetoothSettings())
+
+        final List<ScanEntry> entries = new ArrayList<>();
+        final ArrayAdapter<ScanEntry> list = new ArrayAdapter<>(this, android.R.layout.select_dialog_item, entries);
+        final AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Scanning for ESP32-S3…")
+                .setAdapter(list, (d, which) -> {
+                    ble.stopScan();
+                    if (which >= 0 && which < entries.size()) connectDevice(entries.get(which).device);
+                })
                 .setNegativeButton("Cancel", null)
-                .show();
+                .create();
+        final Runnable finishScan = () -> {
+            ble.stopScan();
+            if (dialog.isShowing())
+                dialog.setTitle(entries.isEmpty() ? "No BLE devices found — tap Cancel and retry" : "Select your ESP32-S3");
+        };
+        dialog.setOnDismissListener(d -> { ui.removeCallbacks(finishScan); ble.stopScan(); });
+
+        boolean started = ble.startScan(new BleUartClient.ScanListener() {
+            @Override public void onDevice(BluetoothDevice device, String name, int rssi, boolean advertisesNus) {
+                ScanEntry found = null;
+                for (ScanEntry e : entries) if (e.device.getAddress().equals(device.getAddress())) { found = e; break; }
+                // Hide anonymous beacons; keep anything named or advertising the UART service.
+                if (found == null && name == null && !advertisesNus) return;
+                boolean resort = found == null || (advertisesNus && !found.nus);
+                if (found == null) { found = new ScanEntry(device); entries.add(found); }
+                if (name != null) found.name = name;
+                found.nus |= advertisesNus;
+                found.rssi = rssi;
+                if (resort) {
+                    // UART-service devices first, then likely ESP32 names, then by signal.
+                    Collections.sort(entries, (a, b) -> {
+                        if (a.nus != b.nus) return a.nus ? -1 : 1;
+                        boolean ae = a.name != null && a.name.toLowerCase(Locale.ROOT).contains("esp");
+                        boolean be = b.name != null && b.name.toLowerCase(Locale.ROOT).contains("esp");
+                        if (ae != be) return ae ? -1 : 1;
+                        return Integer.compare(b.rssi, a.rssi);
+                    });
+                }
+                list.notifyDataSetChanged();
+            }
+            @Override public void onScanFailed(int errorCode) {
+                ui.removeCallbacks(finishScan);
+                if (dialog.isShowing()) dialog.setTitle("BLE scan failed (code " + errorCode + ")");
+                addEvent("BLE scan failed with code " + errorCode + ". Toggle Bluetooth and retry.");
+            }
+        });
+        if (!started) { showToast("Could not start BLE scan"); return; }
+        dialog.show();
+        ui.postDelayed(finishScan, SCAN_DURATION_MS);
+    }
+
+    @SuppressLint("MissingPermission")
+    private void requestBluetoothOn() {
+        try { startActivity(new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)); }
+        catch (ActivityNotFoundException | SecurityException e) { openBluetoothSettings(); }
     }
 
     private void openBluetoothSettings() {
@@ -702,84 +768,74 @@ public final class MainActivity extends Activity {
         catch (ActivityNotFoundException e) { showToast("Open Bluetooth in Android settings"); }
     }
 
-    @SuppressLint("MissingPermission")
+    // --------------------------------------------------------------- BLE session
+
     private void connectDevice(BluetoothDevice device) {
-        if (!hasConnectPermission()) { ensureBluetoothPermission(); return; }
-        disconnectSocket();
-        int epoch = session.get();
-        String name = device.getName() == null ? device.getAddress() : device.getName();
-        connectionLabel.setText("CONNECTING…");
-        connectionLabel.setTextColor(ORANGE);
-        connectionDot.setBackground(rounded(ORANGE, 100, 0));
-        selectedDevice.setText(name);
-        connectButton.setText("Connecting…");
-        connectButton.setEnabled(false);
-        new Thread(() -> {
-            BluetoothSocket s = null;
-            String failure = "Unknown connection error";
-            try {
-                s = device.createRfcommSocketToServiceRecord(SPP_UUID);
-                s.connect();
-            } catch (IOException first) {
-                failure = first.getMessage();
-                closeQuietly(s);
-                s = null;
-                // Older HC-05/HC-06 modules sometimes need the insecure RFCOMM variant.
-                try {
-                    s = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID);
-                    s.connect();
-                } catch (IOException second) {
-                    failure = second.getMessage();
-                    closeQuietly(s);
-                    final String err = failure;
-                    ui.post(() -> {
-                        if (session.get() == epoch) {
-                            updateConnectionUI(false, null);
-                            addEvent("Connection failed: " + err);
-                        }
-                    });
-                    return;
-                }
-            }
-            if (session.get() != epoch) { closeQuietly(s); return; }
-            try {
-                socket = s;
-                socketOut = s.getOutputStream();
-                InputStream input = s.getInputStream();
-                connected = true;
-                queryReceived = false;
-                BluetoothSocket finalSocket = s;
-                ui.post(() -> {
-                    if (session.get() != epoch) return;
-                    updateConnectionUI(true, name);
-                    addEvent("Connected to " + name + " using serial port profile.");
-                    sendBytes(new byte[]{11, 1}, true);
-                    requestRobotState();
-                    requestCalibrationData(false);
-                });
-                readSocket(input, epoch);
-                closeQuietly(finalSocket);
-                if (session.get() == epoch) ui.post(() -> {
-                    if (session.get() != epoch) return;
-                    disconnectSocket();
-                    addEvent("Bluetooth connection closed; robot will stop via heartbeat timeout.");
-                });
-            } catch (IOException e) {
-                closeQuietly(s);
-                if (session.get() == epoch) ui.post(() -> {
-                    if (session.get() == epoch) {
-                        disconnectSocket();
-                        addEvent("Bluetooth read error: " + e.getMessage());
-                    }
-                });
-            }
-        }, "HC06-Connection").start();
+        if (!hasBlePermissions()) { ensureBluetoothPermission(); return; }
+        resetLinkState();
+        ble.connect(device); // reports progress through bleCallback
     }
 
+    private void showConnectingUI(String name, String label) {
+        connectionLabel.setText(label);
+        connectionLabel.setTextColor(ORANGE);
+        connectionDot.setBackground(rounded(ORANGE, 100, 0));
+        if (name != null) selectedDevice.setText(name);
+        connectButton.setEnabled(true);
+        connectButton.setText("Cancel");
+        updateRunUI();
+    }
+
+    private void updateCounters() {
+        sendCountLabel.setText("TX " + sentBytes + " B  /  RX " + receivedBytes + " B");
+    }
+
+    // All BleUartClient callbacks arrive on the main thread.
+    private final BleUartClient.Callback bleCallback = new BleUartClient.Callback() {
+        @Override public void onConnecting(String name, int attempt, int maxRetries) {
+            showConnectingUI(name, attempt == 0 ? "CONNECTING…" :
+                    "RECONNECTING " + attempt + "/" + maxRetries + "…");
+        }
+        @Override public void onReady(String name, int mtu) {
+            int epoch = session.incrementAndGet();
+            parser = createParser(epoch);
+            connected = true;
+            queryReceived = false;
+            updateConnectionUI(true, name);
+            addEvent("Connected to " + name + " over BLE (Nordic UART, MTU " + mtu + ").");
+            sendBytes(new byte[]{11, 1}, true);
+            requestRobotState();
+            requestCalibrationData(false);
+        }
+        @Override public void onDisconnected(String name, String reason, boolean willRetry) {
+            boolean wasConnected = connected;
+            resetLinkState();
+            String safety = wasConnected ? " Robot stops via ESP32 heartbeat timeout." : "";
+            if (willRetry) {
+                showConnectingUI(name, "RECONNECTING…");
+                addEvent((wasConnected ? "BLE link lost: " : "Connection attempt failed: ") + reason +
+                        ". Retrying automatically…" + safety);
+            } else {
+                updateConnectionUI(false, null);
+                addEvent((wasConnected ? "BLE connection closed: " : "Could not connect: ") + reason + "." + safety);
+            }
+        }
+        @Override public void onData(byte[] data) {
+            receivedBytes += data.length;
+            updateCounters();
+            if (parser != null) parser.feed(data, data.length);
+        }
+        @Override public void onBytesWritten(int count) {
+            sentBytes += count;
+            updateCounters();
+        }
+        @Override public void onError(String message) { addEvent(message); }
+    };
+
     // Stream parser: ignores boot/noise bytes, verifies CRC8 and recovers from
-    // lost bytes without permanently desynchronizing Bluetooth replies.
-    private void readSocket(InputStream input, int epoch) throws IOException {
-        Protocol.Parser parser = new Protocol.Parser(new Protocol.Listener() {
+    // frames split across BLE notifications without permanently desynchronizing.
+    private Protocol.Parser createParser(int epoch) {
+        return new Protocol.Parser(new Protocol.Listener() {
             @Override public void onPacket(int type, byte[] payload) {
                 ui.post(() -> {
                     if (session.get() == epoch) receivePacket(type, payload);
@@ -806,23 +862,11 @@ public final class MainActivity extends Activity {
                         if (session.get() != epoch) return;
                         linkInfo.setText("CRC errors: " + c + "  •  ignored bytes: " + d);
                         if (!queryReceived && c + d > 4)
-                            addEvent("Unverified UART bytes: check 9600 baud, TX/RX and supply noise.");
+                            addEvent("Unverified bytes from ESP32: check the firmware's TX protocol and supply noise.");
                     });
                 }
             }
         });
-        byte[] buffer = new byte[128];
-        while (session.get() == epoch) {
-            int n = input.read(buffer);
-            if (n < 0) break;
-            receivedBytes += n;
-            final int total = receivedBytes;
-            ui.post(() -> {
-                if (session.get() == epoch)
-                    sendCountLabel.setText("TX " + sentBytes + " B  /  RX " + total + " B");
-            });
-            parser.feed(buffer, n);
-        }
     }
 
     private void handleReply(int b) {
@@ -915,28 +959,11 @@ public final class MainActivity extends Activity {
                     ", PID synchronized.");
     }
 
+    /** Sends exact binary bytes (e.g. {7, 1}) to the NUS RX characteristic. */
     private void sendBytes(byte[] payload, boolean reportErrors) {
-        if (!connected) {
-            if (reportErrors) showToast("HC-06 is disconnected");
-            return;
+        if (!connected || !ble.send(payload)) {
+            if (reportErrors) showToast("ESP32 is disconnected");
         }
-        final int expectedSession = session.get();
-        writer.execute(() -> {
-            try {
-                synchronized (outputLock) {
-                    if (expectedSession != session.get()) return;
-                    OutputStream out = socketOut;
-                    if (out == null || !connected) return;
-                    out.write(payload);
-                    out.flush();
-                }
-                sentBytes += payload.length;
-                ui.post(() -> sendCountLabel.setText("TX " + sentBytes + " B  /  RX " + receivedBytes + " B"));
-            } catch (IOException e) {
-                if (reportErrors) ui.post(() -> addEvent("Send failed: " + e.getMessage()));
-                ui.post(() -> disconnectSocket());
-            }
-        });
     }
 
     private void updateConnectionUI(boolean active, String name) {
@@ -944,29 +971,28 @@ public final class MainActivity extends Activity {
         connectionLabel.setTextColor(active ? MINT : RED);
         connectionDot.setBackground(rounded(active ? MINT : RED, 100, 0));
         if (name != null) selectedDevice.setText(name);
-        else if (!active) selectedDevice.setText("No Bluetooth module connected");
+        else if (!active) selectedDevice.setText("No ESP32 connected");
         connectButton.setEnabled(true);
-        connectButton.setText(active ? "Disconnect HC-06" : "Select paired HC-06");
+        connectButton.setText(active ? "Disconnect ESP32" : "Scan for ESP32 (BLE)");
         updateRunUI();
     }
 
-    private void disconnectSocket() {
+    /** Clears per-connection state; stale parser callbacks are ignored via the session counter. */
+    private void resetLinkState() {
         session.incrementAndGet();
+        parser = null;
         running = false;
         startPending = false;
         queryReceived = false;
         connected = false;
         if (sensorView != null) sensorView.setConnected(false);
-        socketOut = null;
-        BluetoothSocket old = socket;
-        socket = null;
-        closeQuietly(old);
-        if (Looper.getMainLooper() == Looper.myLooper()) updateConnectionUI(false, null);
-        else ui.post(() -> updateConnectionUI(false, null));
     }
 
-    private void closeQuietly(BluetoothSocket s) {
-        try { if (s != null) s.close(); } catch (Exception ignored) { }
+    /** User-initiated disconnect (or app shutdown): no automatic reconnection. */
+    private void disconnectLink() {
+        resetLinkState();
+        if (ble != null) ble.disconnect();
+        if (connectionLabel != null) updateConnectionUI(false, null);
     }
 
     private void addEvent(String s) {

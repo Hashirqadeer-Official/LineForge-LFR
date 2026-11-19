@@ -1,10 +1,13 @@
 package com.lineforge.lfr;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 /**
- * Recovering streaming decoder for LineForge Bluetooth SPP.
- * SPP is a byte stream, not a packet transport. Handles arbitrary read splits,
+ * Recovering streaming decoder for LineForge Bluetooth replies.
+ * Works for BLE NUS notifications as well as the original SPP byte stream:
+ * a frame may span several notifications. Handles arbitrary read splits,
  * garbage/ROM boot logs, broken checksums, legacy replies and framed packets.
  */
 public final class Protocol {
@@ -41,6 +44,19 @@ public final class Protocol {
         }
         out[5+payload.length] = (byte)crc;
         return out;
+    }
+
+    /**
+     * Splits outgoing two-byte commands into BLE writes of at most maxWrite bytes.
+     * Chunks always have an even length, so a [command, value] pair is never
+     * split across two GATT writes (ESP32 firmware may parse each write alone).
+     */
+    public static List<byte[]> splitForWrite(byte[] packet, int maxWrite) {
+        int limit = Math.max(2, maxWrite & ~1);
+        List<byte[]> chunks = new ArrayList<>();
+        for (int at = 0; at < packet.length; at += limit)
+            chunks.add(Arrays.copyOfRange(packet, at, Math.min(packet.length, at + limit)));
+        return chunks;
     }
 
     public static final class Parser {
