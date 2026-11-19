@@ -4,9 +4,12 @@
   No HC-05/HC-06 needed. BLE name: "ESP32-S3 Line Follower".
     Service 6E400001-..., RX 6E400002-... (phone writes), TX 6E400003-... (notify)
 
-  - Power-on: 2 s stationary on WHITE, then 5 s sweeping all 8 sensors
-    over the BLACK line (set CALIBRATE_EVERY_BOOT=false to reuse the
-    calibration saved in NVS instead).
+  - Power-on does NOT calibrate: it reuses the calibration saved in NVS.
+    Calibrate only from the app (RECALIBRATE SENSORS): 2 s stationary on
+    WHITE, then 5 s sweeping all 8 sensors over the BLACK line.
+    LED: GREEN = calibrated, ORANGE = no calibration yet (press RECALIBRATE),
+    WHITE = calibrating, RED = calibration failed.
+    (Set CALIBRATE_AT_BOOT=true for the old calibrate-at-power-on behaviour.)
   - Valid calibration is saved in NVS.
   - PID tuning is saved in NVS 2 s after the last changed parameter;
     STOP also saves pending PID changes immediately.
@@ -66,7 +69,10 @@ struct SpeedRecord;
 
 // ---------------- User options ----------------
 const bool WAIT_FOR_APP = true;
-const bool CALIBRATE_EVERY_BOOT = true; // false = reuse NVS calibration at boot
+// false = never calibrate at power-on; calibrate only from the app's
+//         RECALIBRATE SENSORS button (saved calibration is reused at boot).
+// true  = calibrate (2 s white + 5 s sweep) every time the robot is switched on.
+const bool CALIBRATE_AT_BOOT = false;
 const int RGB_LED_PIN = 48;              // use 38 for official DevKitC-1 v1.1
 // Default speeds (percent of full PWM). The app can change them (commands
 // 13/14); the app's values are saved in NVS and used after the next boot.
@@ -791,14 +797,18 @@ void setup() {
   if (loadSpeed()) Serial.println("Stored speed loaded from NVS");
   Serial.printf("Speed: base %d%%  max %d%%\n", baseSpeed, maxSpeed);
 
-  if (!CALIBRATE_EVERY_BOOT && loadCalibration()) {
-    calOk = true;
-    showLED(0, 40, 0);
-    Serial.println("Stored calibration loaded; skipping 7 s calibration");
-    BT.write(CAL_LOADED);
-  } else {
+  if (CALIBRATE_AT_BOOT) {
     Serial.println("Calibrating now: 2 s on WHITE, then 5 s sweep over the line");
     performCalibration();
+  } else if (loadCalibration()) {
+    calOk = true;
+    showLED(0, 40, 0);   // GREEN: saved calibration ready
+    Serial.println("Stored calibration loaded; no calibration at power-on");
+    BT.write(CAL_LOADED);
+  } else {
+    calOk = false;       // motors stay off until calibrated from the app
+    showLED(40, 15, 0);  // ORANGE: waiting for RECALIBRATE SENSORS
+    Serial.println("No saved calibration: press RECALIBRATE SENSORS in the app");
   }
 
   // Only an initial startup is allowed to auto-start when configured.
