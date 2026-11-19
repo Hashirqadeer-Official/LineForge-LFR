@@ -1,4 +1,4 @@
-name: Build and Release LineForge v1.1 APK
+name: Build and Release LineForge APK
 
 on:
   push:
@@ -55,9 +55,10 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # On pushes to main/master: create a uniquely tagged preview Release.
+      # On pushes to main/master: create the next numbered preview Release,
+      # continuing after the highest existing build-N tag (build-4 -> build-5 -> ...).
       # On v1.2.3 tags: create a versioned Release.
-      # On reruns: replace the existing APK asset on that same Release.
+      # On reruns of the same commit: replace the APK asset on that commit's Release.
       - name: Publish APK to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -70,7 +71,18 @@ jobs:
             TITLE="LineForge LFR $TAG"
             STABLE=true
           else
-            TAG="build-${GITHUB_RUN_NUMBER}"
+            # Existing build-N tags on GitHub (no full clone/fetch needed).
+            BUILD_TAGS="$(git ls-remote --tags origin 'refs/tags/build-*')"
+            # If this exact commit was already released (a rerun), reuse that tag.
+            TAG="$(printf '%s\n' "$BUILD_TAGS" | awk -v sha="$GITHUB_SHA" \
+              '$1 == sha { t = $2; sub(/^refs\/tags\//, "", t); sub(/\^[{][}]$/, "", t); print t; exit }')"
+            if [[ -z "$TAG" ]]; then
+              LAST="$(printf '%s\n' "$BUILD_TAGS" \
+                | sed -n 's#.*refs/tags/build-\([0-9][0-9]*\)\(\^{}\)\{0,1\}$#\1#p' \
+                | sort -n | tail -n 1)"
+              TAG="build-$(( ${LAST:-0} + 1 ))"
+            fi
+            echo "Preview release tag: $TAG"
             TITLE="LineForge LFR preview $TAG"
             STABLE=false
           fi
