@@ -24,7 +24,10 @@
       [3,value] Ki numerator    [4,value] Ki decimal divider (0..4)
       [5,value] Kd numerator    [6,value] Kd decimal divider (0..4)
       [7,0] STOP               [7,1] START
-      [8,1] Recalibrate (BOOT button is alternative)
+      [8,1] Recalibrate manually: 2 s still on white + 5 s hand sweep
+      [8,2] Auto calibrate: spin in place on the line
+      [8,3] Auto calibrate: wiggle left/right over the line
+            (BOOT button held 2 s = manual calibration)
     [9,0] Read back PID and status: reply = 9 bytes:
       [0xD0, kpVal, kpDiv, kiVal, kiDiv, kdVal, kdDiv, flags, checksum]
       flags bit 0=calibration OK, bit 1=running, bit 2=calibrating
@@ -33,9 +36,25 @@
     [11,1] Enable framed telemetry for 4 s (refresh periodically)
     [11,0] Disable telemetry; [12,0] Read white/black calibration arrays.
     [13,value] Base speed % (0..100)   [14,value] Max speed % (0..100)
+    [15,value] Auto-calibration time, seconds (1..10)
+    [16,value] Auto-calibration turn speed % (10..100)
+    STOP [7,0] during calibration cancels it (previous calibration kept).
+    [17,flags] Option bits: bit 0 = sharp-turn recovery,
+               bit 1 = keep the saved calibration if a new one fails,
+               bit 2 = competition route mode
+    [19,0] Use the calibration saved in NVS (reply 0xC2, or NAK if none)
+    Competition route (option bit 2 = route mode):
+    [20,n] Start uploading a route of n steps (0..32)
+    [21,step] One route step: high nibble = action, low nibble = seconds
+              1 left, 2 right, 3 straight, 4 U-turn, 5 wait + blue LED,
+              6 wait + green LED, 7 finish (stop)
+    [22,value] Turn delay: drive forward value x 10 ms before turning
+    Replies: 0xE1 route finished, 0xE0 route stopped (turn not completed).
+    [18,value] Sharp-turn spin speed % (10..100)
     Frame: A5 5A type length seq payload CRC8(poly=07 over type..payload).
-    Type 51: status (10 payload bytes: six PID fields, flags, reserved,
-             base speed %, max speed %).
+    Type 51: status (14 payload bytes: six PID fields, flags, reserved,
+             base speed %, max speed %, rule flags, spin speed %,
+             route length, turn delay / 10 ms).
     Type 52: eight QTR intensities + position (u16) + flags + signed PWM L/R.
     Type 53: stored white and black ADC raw readings (32 bytes).
     Replies: 0x06 ACK, 0x15 NAK, 0xC1 calibration success,
@@ -66,6 +85,8 @@
 struct CalibrationRecord;
 struct PIDRecord;
 struct SpeedRecord;
+struct RuleRecord;
+struct RouteRecord;
 
 // ---------------- User options ----------------
 const bool WAIT_FOR_APP = true;
@@ -80,6 +101,10 @@ const int DEFAULT_BASE_SPEED = 25;      // forward speed in PID mode
 const int DEFAULT_MAX_SPEED  = 30;      // maximum magnitude of either motor
 // START gives a short straight pulse at MAX speed to overcome static friction.
 const uint32_t START_PULSE_MS = 180;    // disable by setting to 0
+// Automatic calibration defaults (the app sends its own values first).
+const int DEFAULT_AUTO_CAL_SECONDS = 3;
+const int DEFAULT_AUTO_CAL_SPEED = 30;  // percent
+const uint32_t WIGGLE_HALF_MS = 400;   // one left or right swing
 const uint32_t PID_SAVE_DELAY_MS = 2000;
 const uint32_t CONTROL_PERIOD_US = 5000;
 const uint32_t BOOT_HOLD_MS = 2000;
@@ -90,6 +115,11 @@ const uint32_t TELEMETRY_LEASE_MS = 4000; // off after app stops refreshing
 const bool REQUIRE_APP_HEARTBEAT = WAIT_FOR_APP;
 const uint32_t HEARTBEAT_TIMEOUT_MS = 2500;
 const int MIN_CAL_RANGE = 300;          // raw 12-bit ADC counts
+// Sharp-turn recovery rule (switched on/off from the app's Rules tab).
+const int EDGE_THRESHOLD = 500;         // calibrated 0..1000: outer sensor sees line
+const float CENTERED_ERROR = 1.5f;      // line this close to center clears the edge memory
+const uint32_t PIVOT_TIMEOUT_MS = 1500; // give up spinning if the line is not found
+const int DEFAULT_PIVOT_SPEED = 35;     // percent
 
 // ---------------- Pin connections ----------------
 const int AIN1 = 42, AIN2 = 41, PWMA = 21; // left motor
@@ -166,6 +196,7 @@ class BleUart {
     dropped = true;
   }
   bool takeLinkDropped() { bool d = dropped; dropped = false; return d; }
+  bool isConnected() const { return connected; }
 
   BLECharacteristic *tx = nullptr;
 
@@ -236,6 +267,46 @@ int black[8] = {0};
 bool calOk = false;
 bool calibrating = false;
 bool calibrationPending = false;
+const uint8_t CAL_MANUAL = 1, CAL_SPIN = 2, CAL_WIGGLE = 3;
+uint8_t pendingCalMode = CAL_MANUAL;
+volatile bool calibrationAbort = false;  // set by STOP during calibration
+int autoCalSeconds = DEFAULT_AUTO_CAL_SECONDS;
+int autoCalSpeed = DEFAULT_AUTO_CAL_SPEED;
+const uint8_t RULE_SHARP_TURN = 0x01;
+const uint8_t RULE_KEEP_OLD_CAL = 0x02;  // failed calibration falls back to NVS
+uint8_t ruleFlags = RULE_KEEP_OLD_CAL;  // cmd 17, saved in NVS (keep-old-cal on by default)
+int pivotSpeed = DEFAULT_PIVOT_SPEED;   // cmd 18, saved in NVS
+int8_t lastEdge = 0;                    // -1 = S1 (left) saw line last, +1 = S8 (right)
+int8_t pivotDir = 0;                    // 0 = not pivoting, -1 left, +1 right
+uint32_t pivotStartMs = 0;
+
+// ---- Competition route (option bit 2) ----
+const uint8_t RULE_ROUTE = 0x04;
+const int MAX_ROUTE_STEPS = 32;
+const uint8_t ACT_LEFT = 1, ACT_RIGHT = 2, ACT_STRAIGHT = 3, ACT_UTURN = 4,
+              ACT_WAIT_BLUE = 5, ACT_WAIT_GREEN = 6, ACT_FINISH = 7;
+// Optional external indicator LEDs (-1 = only use the on-board RGB LED).
+const int BLUE_LED_PIN = -1;            // water filled
+const int GREEN_LED_PIN = -1;           // people rescued
+const uint32_t ARM_MS = 150;            // centered line needed before the next junction
+const uint32_t BOX_DETECT_MS = 250;     // whole array dark this long = inside a box
+const uint32_t JUNCTION_TIMEOUT_MS = 1500;
+const uint32_t TURN_TIMEOUT_MS = 3000;  // a turn that never finds the line stops the run
+const uint32_t REVERSE_MS = 250;        // back out of a box before a U-turn
+const uint32_t TURN_LEAVE_MIN_MS = 80;
+const uint32_t UTURN_LEAVE_MIN_MS = 300;
+const uint8_t ROUTE_FINISHED = 0xE1, ROUTE_FAILED = 0xE0;
+const uint8_t RS_FOLLOW = 0, RS_JUNCTION = 1, RS_TURN_FWD = 2, RS_TURN_LEAVE = 3,
+              RS_TURN_FIND = 4, RS_REVERSE = 5, RS_WAIT = 6;
+uint8_t route[MAX_ROUTE_STEPS];
+int routeLen = 0;
+int routeIdx = 0;
+int routeUploadLeft = 0;
+int turnDelayMs = 100;                  // cmd 22, saved in NVS
+uint8_t routeState = RS_FOLLOW;
+uint32_t routeStateMs = 0, armedSinceMs = 0, fullDarkSinceMs = 0, waitMs = 0;
+bool routeArmed = false, jSawLeft = false, jSawRight = false, turnIsUTurn = false;
+int8_t turnDir = 0;
 bool robotOn = false;
 bool pidLast = false;
 bool startPulseActive = false;
@@ -264,6 +335,8 @@ int basePwm() { return min(baseSpeed, maxSpeed) * 255 / 100; }
 const uint32_t CAL_MAGIC = 0x4C465243;  // 'LFRC'
 const uint32_t PID_MAGIC = 0x4C465250;  // 'LFRP'
 const uint32_t SPD_MAGIC = 0x4C465253;  // 'LFRS'
+const uint32_t RUL_MAGIC = 0x4C465252;  // 'LFRR'
+const uint32_t RTE_MAGIC = 0x4C465254;  // 'LFRT'
 const uint16_t STORAGE_VERSION = 1;
 
 struct CalibrationRecord {
@@ -281,6 +354,21 @@ struct PIDRecord {
   uint8_t kpVal, kpDiv;
   uint8_t kiVal, kiDiv;
   uint8_t kdVal, kdDiv;
+  uint32_t checksum;
+};
+
+struct RouteRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint8_t len, turnDelay10;
+  uint8_t steps[32];
+  uint32_t checksum;
+};
+
+struct RuleRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint8_t flags, pivotSpeed;
   uint32_t checksum;
 };
 
@@ -353,10 +441,60 @@ bool saveSpeed() {
   return prefs.putBytes("spd", &r, sizeof(r)) == sizeof(r);
 }
 
-// Saves PID and speed settings (both change through the same "dirty" flag).
+bool loadRules() {
+  if (!prefsReady || prefs.getBytesLength("rul") != sizeof(RuleRecord)) return false;
+  RuleRecord r = {};
+  if (prefs.getBytes("rul", &r, sizeof(r)) != sizeof(r)) return false;
+  if (r.magic != RUL_MAGIC || r.version != STORAGE_VERSION) return false;
+  if (r.checksum != checksum32(&r, offsetof(RuleRecord, checksum))) return false;
+  if (r.pivotSpeed < 10 || r.pivotSpeed > 100) return false;
+  ruleFlags = r.flags;
+  pivotSpeed = r.pivotSpeed;
+  return true;
+}
+
+bool saveRules() {
+  if (!prefsReady) return false;
+  RuleRecord r = {};
+  r.magic = RUL_MAGIC;
+  r.version = STORAGE_VERSION;
+  r.flags = ruleFlags;
+  r.pivotSpeed = (uint8_t)pivotSpeed;
+  r.checksum = checksum32(&r, offsetof(RuleRecord, checksum));
+  return prefs.putBytes("rul", &r, sizeof(r)) == sizeof(r);
+}
+
+bool loadRoute() {
+  if (!prefsReady || prefs.getBytesLength("rte") != sizeof(RouteRecord)) return false;
+  RouteRecord r = {};
+  if (prefs.getBytes("rte", &r, sizeof(r)) != sizeof(r)) return false;
+  if (r.magic != RTE_MAGIC || r.version != STORAGE_VERSION) return false;
+  if (r.checksum != checksum32(&r, offsetof(RouteRecord, checksum))) return false;
+  if (r.len > MAX_ROUTE_STEPS || r.turnDelay10 > 50) return false;
+  routeLen = r.len;
+  for (int i = 0; i < routeLen; ++i) route[i] = r.steps[i];
+  turnDelayMs = r.turnDelay10 * 10;
+  return true;
+}
+
+bool saveRoute() {
+  if (!prefsReady) return false;
+  RouteRecord r = {};
+  r.magic = RTE_MAGIC;
+  r.version = STORAGE_VERSION;
+  r.len = (uint8_t)routeLen;
+  r.turnDelay10 = (uint8_t)(turnDelayMs / 10);
+  for (int i = 0; i < routeLen; ++i) r.steps[i] = route[i];
+  r.checksum = checksum32(&r, offsetof(RouteRecord, checksum));
+  return prefs.putBytes("rte", &r, sizeof(r)) == sizeof(r);
+}
+
+// Saves PID, speed and rule settings (all change through the same "dirty" flag).
 bool savePID() {
   if (!prefsReady) return false;
   saveSpeed();
+  saveRules();
+  saveRoute();
 
   PIDRecord r = {};
   r.magic = PID_MAGIC;
@@ -449,6 +587,9 @@ void setMotors(int left, int right) {
 
 void stopRobot() {
   startPulseActive = false;
+  pivotDir = 0;
+  lastEdge = 0;
+  routeState = RS_FOLLOW;
   robotOn = false;
   pidLast = false;
   iTerm = 0.0f;
@@ -500,7 +641,7 @@ void sendSensorFrameIfDue() {
   }
   if ((uint32_t)(now - lastTelemetryMs) < TELEMETRY_PERIOD_MS) return;
   lastTelemetryMs = now;
-  uint8_t p[13] = {};
+  uint8_t p[16] = {};
   long weighted = 0, total = 0;
   for (int s = 0; s < 8; s++) {
     int raw = readRaw(QTR[s]);
@@ -519,9 +660,12 @@ void sendSensorFrameIfDue() {
   uint16_t pos = total > 0 ? (uint16_t)(weighted * 1000L / total) : 0xffff;
   p[8] = (uint8_t)(pos & 255); p[9] = (uint8_t)(pos >> 8);
   p[10] = ((total > 0) ? 1 : 0) | (calOk ? 2 : 0) |
-          (robotOn ? 4 : 0) | (calibrating ? 8 : 0);
+          (robotOn ? 4 : 0) | (calibrating ? 8 : 0) | (pivotDir != 0 ? 16 : 0);
   p[11] = (uint8_t)(int8_t)constrain(lastMotorLeft * 100 / 255, -100, 100);
   p[12] = (uint8_t)(int8_t)constrain(lastMotorRight * 100 / 255, -100, 100);
+  p[13] = (uint8_t)routeIdx;   // route progress (steps done)
+  p[14] = (uint8_t)routeLen;
+  p[15] = routeState;
   sendFramed(PKT_SENSOR, p, sizeof(p));
 }
 
@@ -542,11 +686,15 @@ void sendStatusFrame() {
   for (int i = 1; i <= 7; i++) crc ^= frame[i];
   frame[8] = crc;
   if (telemetryEnabled) {
-    uint8_t p[10];
+    uint8_t p[14];
     for (int i = 0; i < 7; ++i) p[i] = frame[i+1];
     p[7] = 0; // reserved for future protocol versions
     p[8] = (uint8_t)baseSpeed;
     p[9] = (uint8_t)maxSpeed;
+    p[10] = ruleFlags;
+    p[11] = (uint8_t)pivotSpeed;
+    p[12] = (uint8_t)routeLen;
+    p[13] = (uint8_t)(turnDelayMs / 10);
     sendFramed(PKT_STATUS, p, sizeof(p));
   } else BT.write(frame, sizeof(frame));
 }
@@ -556,7 +704,7 @@ void sendStatusFrame() {
 void readBluetooth() {
   while (BT.available() >= 2) {
     int cmd = BT.peek();
-    if (cmd < 1 || cmd > 14) {
+    if (cmd < 1 || cmd > 22) {
       BT.read();  // skip invalid leading byte
       continue;
     }
@@ -565,13 +713,80 @@ void readBluetooth() {
 
     if (((cmd == 2 || cmd == 4 || cmd == 6) && val > 4) ||
         (cmd == 7 && val > 1) ||
-        (cmd == 8 && val != 1) ||
+        (cmd == 8 && (val < 1 || val > 3)) ||
         (cmd == 9 && val != 0) ||
         (cmd == 10 && val != 1) ||
         (cmd == 11 && val > 1) ||
         (cmd == 12 && val != 0) ||
-        ((cmd == 13 || cmd == 14) && val > 100)) {
+        ((cmd == 13 || cmd == 14) && val > 100) ||
+        (cmd == 15 && (val < 1 || val > 10)) ||
+        (cmd == 16 && (val < 10 || val > 100)) ||
+        (cmd == 18 && (val < 10 || val > 100)) ||
+        (cmd == 19 && val != 0) ||
+        (cmd == 20 && val > MAX_ROUTE_STEPS) ||
+        (cmd == 21 && ((val >> 4) < ACT_LEFT || (val >> 4) > ACT_FINISH)) ||
+        (cmd == 22 && val > 50)) {
       BT.write(NAK);
+      continue;
+    }
+
+    if (cmd >= 20 && cmd <= 22) {
+      if (robotOn) { BT.write(NAK); continue; }  // never change the route mid-run
+      if (cmd == 20) {
+        routeLen = 0;
+        routeUploadLeft = val;
+      } else if (cmd == 21) {
+        if (routeUploadLeft <= 0 || routeLen >= MAX_ROUTE_STEPS) { BT.write(NAK); continue; }
+        route[routeLen++] = (uint8_t)val;
+        routeUploadLeft--;
+      } else {
+        turnDelayMs = val * 10;
+      }
+      if (cmd == 22 || routeUploadLeft == 0) {
+        pidDirty = true;               // saved to NVS together with PID
+        lastPIDChangeMs = millis();
+        if (cmd != 22) Serial.printf("Route received: %d steps\n", routeLen);
+      }
+      BT.write(ACK);
+      continue;
+    }
+
+    if (cmd == 19) {
+      // Go back to the calibration stored in NVS (e.g. a new one failed).
+      if (calibrating || calibrationPending || robotOn) {
+        BT.write(NAK);
+      } else if (loadCalibration()) {
+        calOk = true;
+        showLED(0, 40, 0);
+        Serial.println("Saved calibration restored from NVS");
+        BT.write(CAL_LOADED);
+      } else {
+        Serial.println("No valid saved calibration in NVS");
+        BT.write(NAK);
+      }
+      if (telemetryEnabled) { sendCalibrationFrame(); sendStatusFrame(); }
+      continue;
+    }
+
+    if (cmd == 17 || cmd == 18) {
+      if (cmd == 17) {
+        ruleFlags = (uint8_t)val;
+        if (!(ruleFlags & RULE_SHARP_TURN)) { pivotDir = 0; lastEdge = 0; }
+      } else {
+        pivotSpeed = val;
+      }
+      pidDirty = true;                 // saved to NVS together with PID
+      lastPIDChangeMs = millis();
+      BT.write(ACK);
+      Serial.printf("Rules: sharp-turn recovery %s, spin %d%%\n",
+                    (ruleFlags & RULE_SHARP_TURN) ? "ON" : "OFF", pivotSpeed);
+      continue;
+    }
+
+    if (cmd == 15 || cmd == 16) {
+      if (cmd == 15) autoCalSeconds = val;
+      else autoCalSpeed = val;
+      BT.write(ACK);
       continue;
     }
 
@@ -611,6 +826,7 @@ void readBluetooth() {
       if (calibrating || calibrationPending) {
         BT.write(NAK);
       } else {
+        pendingCalMode = (uint8_t)val;
         calibrationPending = true;
         stopRobot();
         BT.write(ACK);
@@ -620,6 +836,7 @@ void readBluetooth() {
 
     if (cmd == 7) {
       if (val == 0) {
+        if (calibrating) calibrationAbort = true;  // cancel calibration
         stopRobot();
         BT.write(ACK);
         sendStatusFrame(); // App already parses this: confirms motors DISARMED.
@@ -633,6 +850,7 @@ void readBluetooth() {
         lastUs = micros();
         startPulseAtMs = millis();
         startPulseActive = START_PULSE_MS > 0;
+        if (ruleFlags & RULE_ROUTE) routeReset();
 
         // Drive both motors immediately, before the first QTR PID sample.
         // Gives low-speed motors an initial kick against static friction.
@@ -671,42 +889,102 @@ void readBluetooth() {
 }
 
 // ---------------- Calibration routine ----------------
-// Returns true only when all eight sensors have usable white-to-black range.
-// Does NOT overwrite valid saved calibration if a new calibration fails.
-bool performCalibration() {
+// Modes (app command [8, mode]):
+//   CAL_MANUAL (1): 2 s still on WHITE, then 5 s hand sweep over the line.
+//   CAL_SPIN   (2): robot ON the line spins in place for autoCalSeconds.
+//   CAL_WIGGLE (3): robot centered ON the line rocks left/right for autoCalSeconds.
+// Automatic modes record the lowest (white) and highest (black) reading of
+// every sensor while moving. Returns true only when all eight sensors have a
+// usable white-to-black range. A failed or cancelled calibration never
+// overwrites the previous valid one; STOP or a lost BLE link cancels it.
+bool performCalibration(uint8_t mode) {
+  const bool automatic = (mode == CAL_SPIN || mode == CAL_WIGGLE);
+  const bool hadCalibration = calOk;
   calibrating = true;
   calibrationPending = false;
+  calibrationAbort = false;
   calOk = false;
   stopRobot();
   showLED(40, 40, 40);  // WHITE: calibrating
 
-  uint32_t sum[8] = {0};
-  uint32_t samples = 0;
-  uint32_t t0 = millis();
-
-  Serial.println("Calibration: keep all sensors on WHITE for 2 s");
-  while ((uint32_t)(millis() - t0) < 2000U) {
-    for (int s = 0; s < 8; ++s) sum[s] += (uint32_t)readRaw(QTR[s]);
-    ++samples;
-    readBluetooth();
-    sendSensorFrameIfDue();
-    yield();
-  }
   int newWhite[8];
   int newBlack[8] = {0};
-  for (int s = 0; s < 8; ++s)
-    newWhite[s] = (int)(sum[s] / samples);
+  bool aborted = false;
 
-  Serial.println("Calibration: sweep all sensors over BLACK for 5 s");
-  t0 = millis();
-  while ((uint32_t)(millis() - t0) < 5000U) {
-    for (int s = 0; s < 8; ++s) {
-      int raw = readRaw(QTR[s]);
-      if (raw > newBlack[s]) newBlack[s] = raw;
+  if (!automatic) {
+    uint32_t sum[8] = {0};
+    uint32_t samples = 0;
+    uint32_t t0 = millis();
+    Serial.println("Calibration (manual): keep all sensors on WHITE for 2 s");
+    while ((uint32_t)(millis() - t0) < 2000U && !calibrationAbort) {
+      for (int s = 0; s < 8; ++s) sum[s] += (uint32_t)readRaw(QTR[s]);
+      ++samples;
+      readBluetooth();
+      sendSensorFrameIfDue();
+      yield();
     }
-    readBluetooth();
-    sendSensorFrameIfDue();
-    yield();
+    for (int s = 0; s < 8; ++s)
+      newWhite[s] = samples ? (int)(sum[s] / samples) : 4095;
+
+    Serial.println("Calibration (manual): sweep all sensors over BLACK for 5 s");
+    t0 = millis();
+    while ((uint32_t)(millis() - t0) < 5000U && !calibrationAbort) {
+      for (int s = 0; s < 8; ++s) {
+        int raw = readRaw(QTR[s]);
+        if (raw > newBlack[s]) newBlack[s] = raw;
+      }
+      readBluetooth();
+      sendSensorFrameIfDue();
+      yield();
+    }
+    aborted = calibrationAbort;
+  } else {
+    for (int s = 0; s < 8; ++s) newWhite[s] = 4095;
+    const int pwm = autoCalSpeed * 255 / 100;
+    uint32_t durationMs = (uint32_t)autoCalSeconds * 1000U;
+    if (mode == CAL_WIGGLE) {
+      // Whole left-right cycles only, so the robot ends back where it started.
+      uint32_t cycles = (durationMs + WIGGLE_HALF_MS) / (2U * WIGGLE_HALF_MS);
+      if (cycles < 1) cycles = 1;
+      durationMs = cycles * 2U * WIGGLE_HALF_MS;
+    }
+    Serial.printf("Calibration (%s): %lu ms at %d%%\n",
+                  mode == CAL_SPIN ? "auto spin" : "auto wiggle",
+                  (unsigned long)durationMs, autoCalSpeed);
+    uint32_t t0 = millis();
+    while (true) {
+      uint32_t t = millis() - t0;
+      if (t >= durationMs) break;
+      if (calibrationAbort || !BT.isConnected()) { aborted = true; break; }
+      int dir = 1;  // +1 = turn right (clockwise), -1 = turn left
+      if (mode == CAL_WIGGLE) {
+        // right for half a swing, then alternate full swings left/right
+        uint32_t phase = (t + WIGGLE_HALF_MS / 2U) / WIGGLE_HALF_MS;
+        dir = (phase % 2U == 0U) ? 1 : -1;
+      }
+      setMotors(dir * pwm, -dir * pwm);
+      for (int s = 0; s < 8; ++s) {
+        int raw = readRaw(QTR[s]);
+        if (raw < newWhite[s]) newWhite[s] = raw;
+        if (raw > newBlack[s]) newBlack[s] = raw;
+      }
+      readBluetooth();
+      sendSensorFrameIfDue();
+      yield();
+    }
+    setMotors(0, 0);
+  }
+
+  if (aborted) {
+    stopRobot();
+    calOk = hadCalibration;  // white[]/black[] were never touched
+    calibrating = false;
+    showLED(hadCalibration ? 0 : 40, hadCalibration ? 40 : 15, 0);
+    Serial.println("Calibration cancelled; previous calibration kept");
+    BT.write(hadCalibration ? CAL_LOADED : CAL_FAILURE);
+    if (telemetryEnabled) sendStatusFrame();
+    lastUs = micros();
+    return false;
   }
 
   bool good = true;
@@ -730,8 +1008,17 @@ bool performCalibration() {
   } else {
     calOk = false;
     showLED(40, 0, 0);  // RED: calibration failed
-    Serial.println("Calibration FAILED: motors disabled");
+    Serial.println("Calibration FAILED");
     BT.write(CAL_FAILURE);
+    if ((ruleFlags & RULE_KEEP_OLD_CAL) && loadCalibration()) {
+      calOk = true;     // keep driving on the calibration saved in NVS
+      showLED(0, 40, 0);
+      Serial.println("Using the previous calibration saved in NVS");
+      BT.write(CAL_LOADED);
+      if (telemetryEnabled) sendCalibrationFrame();
+    } else {
+      Serial.println("Motors disabled until calibrated");
+    }
     if (telemetryEnabled) sendStatusFrame();
   }
   calibrating = false;
@@ -755,6 +1042,7 @@ void checkBootButton() {
   if (down && !triggered && !calibrating &&
       (uint32_t)(millis() - pressedAt) >= BOOT_HOLD_MS) {
     triggered = true;
+    pendingCalMode = CAL_MANUAL;
     calibrationPending = true;
     stopRobot();
   }
@@ -766,6 +1054,8 @@ void setup() {
   pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
   pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
   pinMode(USER_BOOT_GPIO, INPUT_PULLUP);
+  if (BLUE_LED_PIN >= 0) { pinMode(BLUE_LED_PIN, OUTPUT); digitalWrite(BLUE_LED_PIN, LOW); }
+  if (GREEN_LED_PIN >= 0) { pinMode(GREEN_LED_PIN, OUTPUT); digitalWrite(GREEN_LED_PIN, LOW); }
 
   // Start outputs at 0 duty; STBY on TB6612 must be held HIGH in hardware.
   bool leftPWMok = ledcAttach(PWMA, 20000, 8);
@@ -795,11 +1085,15 @@ void setup() {
   }
   Serial.printf("Kp %.4f Ki %.4f Kd %.4f\n", Kp, Ki, Kd);
   if (loadSpeed()) Serial.println("Stored speed loaded from NVS");
+  if (loadRules()) Serial.println("Stored rules loaded from NVS");
+  if (loadRoute()) Serial.printf("Stored route loaded: %d steps\n", routeLen);
+  Serial.printf("Rules: sharp-turn recovery %s, spin %d%%\n",
+                (ruleFlags & RULE_SHARP_TURN) ? "ON" : "OFF", pivotSpeed);
   Serial.printf("Speed: base %d%%  max %d%%\n", baseSpeed, maxSpeed);
 
   if (CALIBRATE_AT_BOOT) {
     Serial.println("Calibrating now: 2 s on WHITE, then 5 s sweep over the line");
-    performCalibration();
+    performCalibration(CAL_MANUAL);
   } else if (loadCalibration()) {
     calOk = true;
     showLED(0, 40, 0);   // GREEN: saved calibration ready
@@ -818,6 +1112,253 @@ void setup() {
     lastHeartbeatMs = millis();
   }
   lastUs = micros();
+}
+
+// ---------------- Competition route engine ----------------
+// The robot follows the line with PID. When a side of the array (S1+S2 or
+// S7+S8) turns dark it drives straight through the junction, noting which
+// sides had a branch, then decides:
+//   - only one side and nothing ahead = plain 90-degree corner: turn there
+//     automatically (no route step used);
+//   - otherwise (branch with a straight path, T, cross, or a box border)
+//     = run the next route step.
+// Waits stop the motors and light the blue (water) or green (rescue) LED;
+// a U-turn right after a wait backs out of the box first.
+
+void waterLed(bool on) {
+  if (BLUE_LED_PIN >= 0) digitalWrite(BLUE_LED_PIN, on ? HIGH : LOW);
+}
+
+void rescueLed(bool on) {
+  if (GREEN_LED_PIN >= 0) digitalWrite(GREEN_LED_PIN, on ? HIGH : LOW);
+}
+
+void routeReset() {
+  routeIdx = 0;
+  routeState = RS_FOLLOW;
+  routeArmed = false;
+  armedSinceMs = 0;
+  waterLed(false);
+  rescueLed(false);
+  showLED(0, 0, 0);
+  Serial.printf("Route mode: %d steps\n", routeLen);
+}
+
+void enterRouteState(uint8_t state) {
+  routeState = state;
+  routeStateMs = millis();
+}
+
+void routeBackToFollow() {
+  enterRouteState(RS_FOLLOW);
+  routeArmed = false;
+  armedSinceMs = 0;
+  pidLast = false;     // no derivative kick when PID restarts
+  iTerm = 0.0f;
+}
+
+void routeStartTurn(int8_t dir, bool uturn) {
+  turnDir = dir;
+  turnIsUTurn = uturn;
+  enterRouteState(uturn ? RS_REVERSE : RS_TURN_FWD);
+}
+
+void routeFinish() {
+  Serial.println("Route finished");
+  stopRobot();
+  BT.write(ROUTE_FINISHED);
+  sendStatusFrame();
+}
+
+void routeFail(const char *why) {
+  Serial.printf("Route stopped: %s\n", why);
+  stopRobot();
+  BT.write(ROUTE_FAILED);
+  sendStatusFrame();
+}
+
+// Runs the next programmed step at a junction or box.
+void routeNextStep(bool straightAhead) {
+  if (routeIdx >= routeLen) {
+    if (straightAhead) routeBackToFollow();
+    else routeFinish();      // no steps left and nowhere to go
+    return;
+  }
+  const uint8_t step = route[routeIdx++];
+  const uint8_t act = step >> 4;
+  const uint8_t secs = step & 0x0F;
+  Serial.printf("Route step %d/%d: action %d (%d s)\n", routeIdx, routeLen, act, secs);
+  switch (act) {
+    case ACT_LEFT:     routeStartTurn(-1, false); break;
+    case ACT_RIGHT:    routeStartTurn(1, false); break;
+    case ACT_STRAIGHT: routeBackToFollow(); break;
+    case ACT_UTURN:    routeStartTurn(1, true); break;
+    case ACT_WAIT_BLUE:
+      showLED(0, 0, 60);
+      waterLed(true);
+      waitMs = secs * 1000UL;
+      setMotors(0, 0);
+      enterRouteState(RS_WAIT);
+      break;
+    case ACT_WAIT_GREEN:
+      showLED(0, 60, 0);
+      rescueLed(true);
+      waitMs = secs * 1000UL;
+      setMotors(0, 0);
+      enterRouteState(RS_WAIT);
+      break;
+    default:           routeFinish(); break;
+  }
+}
+
+// Returns true when the route engine drives the motors this cycle (PID skipped).
+bool routeStep(const int *cal, int32_t total) {
+  bool d[8];
+  int darkCount = 0;
+  for (int s = 0; s < 8; ++s) {
+    d[s] = cal[s] > EDGE_THRESHOLD;
+    if (d[s]) darkCount++;
+  }
+  const bool center = d[3] || d[4];
+  const bool leftSide = d[0] && d[1];
+  const bool rightSide = d[6] && d[7];
+  const uint32_t now = millis();
+  const uint32_t inState = now - routeStateMs;
+  const int fwd = basePwm();
+  const int spin = pivotSpeed * 255 / 100;
+  (void)total;
+
+  switch (routeState) {
+    case RS_FOLLOW:
+      if (!routeArmed) {
+        // Need a normal, centered line first (leaving the start box or a turn).
+        if (center && !leftSide && !rightSide) {
+          if (armedSinceMs == 0) armedSinceMs = now;
+          if (now - armedSinceMs >= ARM_MS) routeArmed = true;
+        } else {
+          armedSinceMs = 0;
+        }
+        return false;
+      }
+      if (leftSide || rightSide) {
+        jSawLeft = leftSide;
+        jSawRight = rightSide;
+        fullDarkSinceMs = 0;
+        enterRouteState(RS_JUNCTION);
+        setMotors(fwd, fwd);
+        return true;
+      }
+      return false;
+
+    case RS_JUNCTION: {
+      jSawLeft = jSawLeft || leftSide;
+      jSawRight = jSawRight || rightSide;
+      if (darkCount >= 7) { if (fullDarkSinceMs == 0) fullDarkSinceMs = now; }
+      else fullDarkSinceMs = 0;
+      const bool inBox = fullDarkSinceMs != 0 && now - fullDarkSinceMs >= BOX_DETECT_MS;
+      if (!inBox && (leftSide || rightSide) && inState < JUNCTION_TIMEOUT_MS) {
+        setMotors(fwd, fwd);   // keep rolling straight through the junction
+        return true;
+      }
+      const bool straightAhead = center && !inBox;
+      if (!inBox && !straightAhead && jSawLeft != jSawRight) {
+        routeStartTurn(jSawLeft ? -1 : 1, false);  // plain corner: only one way
+        return true;
+      }
+      routeNextStep(straightAhead);
+      return routeState != RS_FOLLOW || !robotOn;
+    }
+
+    case RS_REVERSE:
+      if (inState < REVERSE_MS) { setMotors(-fwd, -fwd); return true; }
+      enterRouteState(RS_TURN_LEAVE);
+      return true;
+
+    case RS_TURN_FWD:
+      if (inState < (uint32_t)turnDelayMs) { setMotors(fwd, fwd); return true; }
+      enterRouteState(RS_TURN_LEAVE);
+      return true;
+
+    case RS_TURN_LEAVE: {
+      setMotors(turnDir < 0 ? -spin : spin, turnDir < 0 ? spin : -spin);
+      const uint32_t minLeave = turnIsUTurn ? UTURN_LEAVE_MIN_MS : TURN_LEAVE_MIN_MS;
+      if (!center && inState >= minLeave) enterRouteState(RS_TURN_FIND);
+      else if (inState > TURN_TIMEOUT_MS) routeFail("could not leave the line");
+      return true;
+    }
+
+    case RS_TURN_FIND:
+      if (center) {
+        lastSeenSide = (float)turnDir;
+        routeBackToFollow();
+        return false;
+      }
+      setMotors(turnDir < 0 ? -spin : spin, turnDir < 0 ? spin : -spin);
+      if (inState > TURN_TIMEOUT_MS) routeFail("line not found after turn");
+      return true;
+
+    case RS_WAIT:
+      setMotors(0, 0);
+      if (inState < waitMs) return true;
+      // A U-turn programmed right after a wait runs immediately (leave the box).
+      if (routeIdx < routeLen && (route[routeIdx] >> 4) == ACT_UTURN) {
+        routeIdx++;
+        Serial.printf("Route step %d/%d: U-turn\n", routeIdx, routeLen);
+        routeStartTurn(1, true);
+      } else {
+        routeBackToFollow();
+      }
+      return true;
+  }
+  return false;
+}
+
+// ---------------- Rule: sharp-turn recovery ----------------
+// If the leftmost (S1) or rightmost (S8) sensor saw the line and then the
+// whole array loses it (typical 90-degree turn taken too fast), spin in place
+// toward that side until that same outer sensor finds the line again:
+//   S1 side: right motor forward, left motor backward (turn left)
+//   S8 side: left motor forward, right motor backward (turn right)
+// Then PID resumes. Returns true while pivoting (PID skipped this cycle).
+bool sharpTurnRule(const int *cal, int32_t weighted, int32_t total) {
+  if (!(ruleFlags & RULE_SHARP_TURN)) return false;
+  const bool leftOuter = cal[0] > EDGE_THRESHOLD;
+  const bool rightOuter = cal[7] > EDGE_THRESHOLD;
+
+  if (pivotDir != 0) {
+    const bool found = (pivotDir < 0) ? leftOuter : rightOuter;
+    const bool timedOut = (uint32_t)(millis() - pivotStartMs) > PIVOT_TIMEOUT_MS;
+    if (found || timedOut) {
+      Serial.println(found ? "Sharp turn: line found, PID resumes"
+                           : "Sharp turn: timeout, PID search resumes");
+      pivotDir = 0;
+      lastEdge = 0;
+      pidLast = false;   // no derivative kick when PID restarts
+      iTerm = 0.0f;
+      return false;
+    }
+    const int pwm = pivotSpeed * 255 / 100;
+    setMotors(pivotDir < 0 ? -pwm : pwm, pivotDir < 0 ? pwm : -pwm);
+    return true;
+  }
+
+  // Remember which outer sensor saw the line last (ignore crossings where both do).
+  if (leftOuter && !rightOuter) lastEdge = -1;
+  else if (rightOuter && !leftOuter) lastEdge = 1;
+  else if (total > 0 && !leftOuter && !rightOuter &&
+           fabsf((float)weighted / (float)total - 3.5f) < CENTERED_ERROR)
+    lastEdge = 0;      // back on the line normally: forget the edge
+
+  if (total == 0 && lastEdge != 0) {
+    pivotDir = lastEdge;
+    pivotStartMs = millis();
+    Serial.printf("Sharp turn: line lost after %s sensor, pivoting %s\n",
+                  pivotDir < 0 ? "S1" : "S8", pivotDir < 0 ? "left" : "right");
+    const int pwm = pivotSpeed * 255 / 100;
+    setMotors(pivotDir < 0 ? -pwm : pwm, pivotDir < 0 ? pwm : -pwm);
+    return true;
+  }
+  return false;
 }
 
 void loop() {
@@ -843,7 +1384,7 @@ void loop() {
   }
 
   if (calibrationPending) {
-    performCalibration();
+    performCalibration(pendingCalMode);
     // Deliberately remain stopped, even when WAIT_FOR_APP is false.
     stopRobot();
     return;
@@ -887,6 +1428,13 @@ void loop() {
       weighted += (int32_t)(calibrated[s] - 250) * s;
       total += calibrated[s] - 250;
     }
+  }
+
+  if (ruleFlags & RULE_ROUTE) {
+    if (routeStep(calibrated, total)) return;   // route engine drives this cycle
+    if (!robotOn) return;                       // route finished or stopped
+  } else if (sharpTurnRule(calibrated, weighted, total)) {
+    return;                                     // pivoting this cycle
   }
 
   float error;

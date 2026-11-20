@@ -21,8 +21,8 @@ public final class QtrSensorView extends View {
     private long lastFrameMs = 0;
     private final int fg = Color.rgb(235, 247, 255);
     private final int dim = Color.rgb(138, 159, 187);
-    private final int mint = Color.rgb(54, 226, 198);
-    private final int panel = Color.rgb(25, 38, 61);
+    private final int mint = Color.rgb(45, 212, 191);
+    private final int panel = Color.rgb(29, 38, 64);
     public QtrSensorView(Context context) {
         super(context);
         setLayerType(View.LAYER_TYPE_SOFTWARE, null);

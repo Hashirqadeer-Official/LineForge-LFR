@@ -23,19 +23,22 @@ import android.os.SystemClock;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
+import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CompoundButton;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
-import android.widget.Spinner;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -54,20 +57,34 @@ import java.util.concurrent.atomic.AtomicInteger;
  * The accompanying firmware extension adds [9,0] status query and [10,1] heartbeat.
  */
 public final class MainActivity extends Activity {
-    private static final int BG = Color.rgb(10, 16, 32);
-    private static final int PANEL = Color.rgb(19, 29, 49);
-    private static final int PANEL_ALT = Color.rgb(25, 38, 61);
-    private static final int BORDER = Color.rgb(43, 59, 83);
-    private static final int TEXT = Color.rgb(240, 246, 255);
-    private static final int MUTED = Color.rgb(151, 168, 191);
-    private static final int MINT = Color.rgb(54, 226, 198);
-    private static final int BLUE = Color.rgb(96, 164, 255);
-    private static final int PURPLE = Color.rgb(177, 136, 255);
-    private static final int RED = Color.rgb(255, 98, 111);
-    private static final int ORANGE = Color.rgb(255, 196, 100);
+    // ------------------------------------------------------------------ palette
+    private static final int BG = Color.rgb(11, 16, 32);
+    private static final int PANEL = Color.rgb(20, 27, 46);
+    private static final int PANEL_ALT = Color.rgb(29, 38, 64);
+    private static final int BORDER = Color.rgb(38, 49, 76);
+    private static final int TEXT = Color.rgb(238, 242, 255);
+    private static final int MUTED = Color.rgb(140, 151, 181);
+    private static final int MINT = Color.rgb(45, 212, 191);
+    private static final int BLUE = Color.rgb(96, 165, 250);
+    private static final int PURPLE = Color.rgb(167, 139, 250);
+    private static final int RED = Color.rgb(248, 113, 113);
+    private static final int ORANGE = Color.rgb(251, 191, 36);
+    private static final int GREEN = Color.rgb(52, 211, 153);
     private static final int REQ_CONNECT = 151;
     private static final long SCAN_DURATION_MS = 12000;
     private static final String PREFS_NAME = "lineforge_ui";
+    private static final int MAX_EVENTS = 40;
+    private static final String[] TAB_NAMES = {"Drive", "Tune", "Calibrate", "Rules", "Log"};
+    private static final int[] TAB_ICONS = {TabIcon.DRIVE, TabIcon.TUNE, TabIcon.CALIBRATE, TabIcon.RULES, TabIcon.LOG};
+    private static final int TAB_CALIBRATE = 2, TAB_LOG = 4;
+    // Option bits shared with the firmware (command 17).
+    private static final int RULE_SHARP_TURN = 0x01, RULE_KEEP_OLD_CAL = 0x02, RULE_ROUTE = 0x04;
+    // Route actions shared with the firmware (command 21: action << 4 | seconds).
+    private static final int ACT_LEFT = 1, ACT_RIGHT = 2, ACT_STRAIGHT = 3, ACT_UTURN = 4,
+            ACT_WAIT_BLUE = 5, ACT_WAIT_GREEN = 6, ACT_FINISH = 7;
+    private static final String[] ACTION_NAMES = {"", "Turn left", "Turn right", "Go straight",
+            "U-turn", "Wait + blue LED (water)", "Wait + green LED (rescue)", "Finish (stop)"};
+    private static final int MAX_ROUTE_STEPS = 32;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final AtomicInteger session = new AtomicInteger();
@@ -95,6 +112,42 @@ public final class MainActivity extends Activity {
     private SpeedControl speed;
     private int sentBytes = 0, receivedBytes = 0;
     private String lastEvent = "Ready to pair";
+
+    // Navigation and status widgets
+    private final View[] pages = new View[TAB_NAMES.length];
+    private final TabIcon[] tabIcons = new TabIcon[TAB_NAMES.length];
+    private final TextView[] tabLabels = new TextView[TAB_NAMES.length];
+    private LinearLayout statusChip;
+    private TextView lastEventLabel, connectHint;
+    private TextView calTileValue, pidTileValue, speedTileValue;
+    private TextView calBadge;
+
+    // Calibration panel
+    private Segmented calModeSeg, calPatternSeg;
+    private Stepper calSeconds, calSpeed;
+    private LinearLayout autoOptions;
+    private TextView calSteps, calProgressText;
+    private ProgressBar calProgress;
+    private Button calStartButton;
+    private boolean calibrating = false;
+    // Rules + saved-calibration options
+    private Switch sharpTurnSwitch, keepOldCalSwitch;
+    private Stepper pivotSpeedStep;
+    private boolean bindingRules = false;
+    private boolean restorePending = false;
+    // Competition route
+    private Switch routeSwitch;
+    private Segmented pathSeg;
+    private Stepper waitReservoirStep, waitBuildingStep, turnDelayStep;
+    private LinearLayout routeListView;
+    private TextView routeSummary;
+    private final ArrayList<int[]> routeSteps = new ArrayList<>();   // {action, seconds}
+    private final ArrayList<String> routeNotes = new ArrayList<>();
+    private int robotRouteLen = -1;
+    private long calFailedAtMs = 0;
+    private boolean calManual = true;
+    private long calStartedMs = 0, calExpectedMs = 0;
+
     private final Runnable heartbeatTask = new Runnable() {
         @Override public void run() {
             if (connected && (running || startPending)) sendBytes(new byte[]{10, 1}, false);
@@ -110,12 +163,12 @@ public final class MainActivity extends Activity {
     @Override public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().setStatusBarColor(BG);
-        getWindow().setNavigationBarColor(BG);
+        getWindow().setNavigationBarColor(PANEL);
         preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         ble = new BleUartClient(this, bleCallback);
         createInterface();
         ui.postDelayed(heartbeatTask, 600);
-        addEvent("Power the ESP32-S3, then tap Scan to find it over BLE. No pairing needed.");
+        addEvent("Switch on the robot, then tap Connect. No pairing needed.");
     }
 
     @Override protected void onStop() {
@@ -131,10 +184,15 @@ public final class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         ui.removeCallbacks(heartbeatTask);
+        ui.removeCallbacks(calTicker);
         ble.stopScan();
         disconnectLink();
         super.onDestroy();
     }
+
+    // ------------------------------------------------------------ view helpers
+
+    private interface IntListener { void on(int value); }
 
     private int dp(float value) {
         return Math.round(getResources().getDisplayMetrics().density * value);
@@ -148,13 +206,18 @@ public final class MainActivity extends Activity {
         return d;
     }
 
+    /** Same color at reduced opacity, for soft tinted backgrounds. */
+    private static int tint(int color, int alpha) {
+        return Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color));
+    }
+
     private TextView txt(String value, int sp, int color, boolean heavy) {
         TextView t = new TextView(this);
         t.setText(value);
         t.setTextSize(sp);
         t.setTextColor(color);
         t.setGravity(Gravity.CENTER_VERTICAL);
-        if (heavy) t.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+        if (heavy) t.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         return t;
     }
 
@@ -171,10 +234,6 @@ public final class MainActivity extends Activity {
         return l;
     }
 
-    private LinearLayout.LayoutParams wrap() {
-        return new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-    }
-
     private LinearLayout.LayoutParams full() {
         return new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
     }
@@ -189,120 +248,254 @@ public final class MainActivity extends Activity {
         return v;
     }
 
+    private View hgap(int width) {
+        View v = new View(this);
+        v.setLayoutParams(new LinearLayout.LayoutParams(dp(width), 1));
+        return v;
+    }
+
     private LinearLayout card() {
         LinearLayout c = col();
-        c.setPadding(dp(18), dp(17), dp(18), dp(18));
+        c.setPadding(dp(18), dp(16), dp(18), dp(18));
         c.setBackground(rounded(PANEL, 20, BORDER));
         return c;
+    }
+
+    /** Card title with an optional muted subtitle on the right. */
+    private LinearLayout cardHeader(String title, String note) {
+        LinearLayout h = row();
+        h.addView(txt(title, 15, TEXT, true), weighted());
+        if (note != null) h.addView(txt(note, 11, MUTED, false));
+        return h;
     }
 
     private Button button(String label, int fill, int foreground) {
         Button b = new Button(this);
         b.setText(label);
         b.setAllCaps(false);
-        b.setTextSize(14);
+        b.setTextSize(15);
         b.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         b.setTextColor(foreground);
         b.setMinHeight(0);
         b.setMinimumHeight(0);
-        b.setPadding(dp(13), dp(13), dp(13), dp(13));
+        b.setStateListAnimator(null);
+        b.setPadding(dp(14), dp(12), dp(14), dp(12));
         b.setBackground(rounded(fill, 14, fill == PANEL_ALT ? BORDER : 0));
         return b;
     }
+
+    private TextView help(String s) {
+        TextView t = txt(s, 12, MUTED, false);
+        t.setLineSpacing(dp(2), 1f);
+        return t;
+    }
+
+    private ScrollView page(LinearLayout content) {
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.setVerticalScrollBarEnabled(false);
+        content.setPadding(dp(16), dp(6), dp(16), dp(24));
+        scroll.addView(content);
+        return scroll;
+    }
+
+    // ------------------------------------------------------------ main layout
 
     private void createInterface() {
         LinearLayout screen = col();
         screen.setBackgroundColor(BG);
         setContentView(screen);
 
-        ScrollView scroll = new ScrollView(this);
-        scroll.setClipToPadding(false);
-        scroll.setFillViewport(true);
-        scroll.setVerticalScrollBarEnabled(false);
-        screen.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1f));
-        LinearLayout content = col();
-        content.setPadding(dp(18), dp(24), dp(18), dp(20));
-        scroll.addView(content);
+        screen.addView(buildTopBar(), full());
 
-        LinearLayout heading = row();
-        TextView mark = txt("LF", 21, BG, true);
+        FrameLayout pager = new FrameLayout(this);
+        screen.addView(pager, new LinearLayout.LayoutParams(-1, 0, 1f));
+        pages[0] = page(buildDrivePage());
+        pages[1] = page(buildTunePage());
+        pages[2] = page(buildCalibratePage());
+        pages[3] = page(buildRulesPage());
+        pages[4] = page(buildLogPage());
+        for (View p : pages) pager.addView(p, new FrameLayout.LayoutParams(-1, -1));
+
+        screen.addView(buildRunBar(), full());
+        screen.addView(buildTabBar(), full());
+
+        kp.restore(); ki.restore(); kd.restore();
+        updateConnectionUI(false, null);
+        showTab(Math.min(TAB_NAMES.length - 1, Math.max(0, preferences.getInt("tab", 0))));
+    }
+
+    private View buildTopBar() {
+        LinearLayout bar = row();
+        bar.setPadding(dp(16), dp(14), dp(16), dp(10));
+        TextView mark = txt("LF", 17, BG, true);
         mark.setGravity(Gravity.CENTER);
-        mark.setBackground(rounded(MINT, 15, 0));
-        heading.addView(mark, new LinearLayout.LayoutParams(dp(47), dp(47)));
-        LinearLayout headingText = col();
-        headingText.setPadding(dp(12), 0, 0, 0);
-        headingText.addView(txt("LINEFORGE", 22, TEXT, true));
-        headingText.addView(txt("ESP32-S3  /  BLUETOOTH PID STUDIO", 10, MUTED, false));
-        heading.addView(headingText);
-        content.addView(heading);
-        content.addView(gap(22));
+        mark.setBackground(rounded(MINT, 12, 0));
+        bar.addView(mark, new LinearLayout.LayoutParams(dp(40), dp(40)));
+        LinearLayout title = col();
+        title.setPadding(dp(11), 0, dp(8), 0);
+        title.addView(txt("LineForge", 19, TEXT, true));
+        title.addView(txt("Line follower control", 11, MUTED, false));
+        bar.addView(title, weighted());
 
-        LinearLayout deviceCard = card();
-        LinearLayout deviceHeader = row();
+        statusChip = row();
+        statusChip.setPadding(dp(11), dp(7), dp(13), dp(7));
         connectionDot = new View(this);
-        connectionDot.setBackground(rounded(RED, 100, 0));
-        deviceHeader.addView(connectionDot, new LinearLayout.LayoutParams(dp(11), dp(11)));
-        connectionLabel = txt("OFFLINE", 12, RED, true);
-        connectionLabel.setPadding(dp(9), 0, 0, 0);
-        deviceHeader.addView(connectionLabel, weighted());
-        TextView protocol = txt("BLE  •  NORDIC UART", 10, MUTED, true);
-        deviceHeader.addView(protocol);
-        deviceCard.addView(deviceHeader);
-        deviceCard.addView(gap(13));
-        selectedDevice = txt("No ESP32 connected", 16, TEXT, true);
-        deviceCard.addView(selectedDevice);
-        deviceCard.addView(gap(14));
-        connectButton = button("Scan for ESP32 (BLE)", MINT, BG);
+        statusChip.addView(connectionDot, new LinearLayout.LayoutParams(dp(8), dp(8)));
+        connectionLabel = txt("Offline", 12, RED, true);
+        connectionLabel.setPadding(dp(7), 0, 0, 0);
+        statusChip.addView(connectionLabel);
+        statusChip.setOnClickListener(v -> showTab(0));
+        bar.addView(statusChip);
+        return bar;
+    }
+
+    private View buildTabBar() {
+        LinearLayout wrap = col();
+        View line = new View(this);
+        line.setBackgroundColor(BORDER);
+        wrap.addView(line, new LinearLayout.LayoutParams(-1, dp(1)));
+        LinearLayout bar = row();
+        bar.setBackgroundColor(PANEL);
+        bar.setPadding(0, dp(6), 0, dp(8));
+        for (int i = 0; i < TAB_NAMES.length; i++) {
+            final int index = i;
+            LinearLayout item = col();
+            item.setGravity(Gravity.CENTER);
+            item.setPadding(0, dp(4), 0, dp(2));
+            tabIcons[i] = new TabIcon(this, TAB_ICONS[i], MUTED);
+            item.addView(tabIcons[i], new LinearLayout.LayoutParams(dp(24), dp(24)));
+            tabLabels[i] = txt(TAB_NAMES[i], 11, MUTED, true);
+            tabLabels[i].setGravity(Gravity.CENTER);
+            tabLabels[i].setPadding(0, dp(3), 0, 0);
+            item.addView(tabLabels[i]);
+            item.setOnClickListener(v -> showTab(index));
+            bar.addView(item, weighted());
+        }
+        wrap.addView(bar, full());
+        return wrap;
+    }
+
+    private void showTab(int index) {
+        blurInputs();
+        for (int i = 0; i < TAB_NAMES.length; i++) {
+            boolean on = i == index;
+            pages[i].setVisibility(on ? View.VISIBLE : View.GONE);
+            tabIcons[i].setColor(on ? MINT : MUTED);
+            tabLabels[i].setTextColor(on ? MINT : MUTED);
+        }
+        preferences.edit().putInt("tab", index).apply();
+    }
+
+    private View buildRunBar() {
+        LinearLayout area = col();
+        area.setPadding(dp(16), dp(10), dp(16), dp(12));
+        area.setBackgroundColor(BG);
+        heroStatus = txt("Motors off", 12, MUTED, true);
+        heroStatus.setGravity(Gravity.CENTER);
+        area.addView(heroStatus, full());
+        area.addView(gap(8));
+        LinearLayout actions = row();
+        startButton = button("▶  Start", MINT, BG);
+        stopButton = button("■  Stop", RED, Color.WHITE);
+        startButton.setTextSize(17);
+        stopButton.setTextSize(17);
+        actions.addView(startButton, new LinearLayout.LayoutParams(0, dp(56), 1f));
+        actions.addView(hgap(10));
+        actions.addView(stopButton, new LinearLayout.LayoutParams(0, dp(56), 1f));
+        startButton.setOnClickListener(v -> startRobot());
+        stopButton.setOnClickListener(v -> stopRobot());
+        area.addView(actions, full());
+        return area;
+    }
+
+    // ------------------------------------------------------------- Drive page
+
+    private LinearLayout buildDrivePage() {
+        LinearLayout content = col();
+
+        LinearLayout conn = card();
+        LinearLayout head = row();
+        LinearLayout names = col();
+        selectedDevice = txt("No robot connected", 17, TEXT, true);
+        names.addView(selectedDevice);
+        connectHint = help("Switch on the robot, then tap Connect.");
+        names.addView(connectHint);
+        head.addView(names, weighted());
+        conn.addView(head);
+        conn.addView(gap(14));
+        connectButton = button("Connect to robot", MINT, BG);
         connectButton.setOnClickListener(v -> {
             if (connected || ble.isActive()) {
                 disconnectLink();
                 addEvent("Disconnected by user.");
             } else ensureBluetoothPermission();
         });
-        deviceCard.addView(connectButton, full());
-        content.addView(deviceCard, full());
-        content.addView(gap(14));
+        conn.addView(connectButton, new LinearLayout.LayoutParams(-1, dp(50)));
+        conn.addView(gap(12));
+        lastEventLabel = txt("", 12, MUTED, false);
+        lastEventLabel.setMaxLines(2);
+        lastEventLabel.setEllipsize(TextUtils.TruncateAt.END);
+        lastEventLabel.setOnClickListener(v -> showTab(TAB_LOG));
+        conn.addView(lastEventLabel, full());
+        content.addView(conn, full());
+        content.addView(gap(12));
 
-        // Always-visible animated eight-channel QTR sensor monitor.
+        // Quick status tiles
+        LinearLayout tiles = row();
+        calTileValue = addTile(tiles, "Calibration", v -> showTab(TAB_CALIBRATE));
+        tiles.addView(hgap(8));
+        pidTileValue = addTile(tiles, "PID", v -> showTab(1));
+        tiles.addView(hgap(8));
+        speedTileValue = addTile(tiles, "Speed", null);
+        content.addView(tiles, full());
+        content.addView(gap(12));
+
         LinearLayout sensorCard = card();
-        LinearLayout sensorHeading = row();
-        sensorHeading.addView(txt("LIVE LINE ARRAY", 13, TEXT, true), weighted());
-        sensorHeading.addView(txt("QTR-8A  •  S1–S8", 11, MUTED, false));
-        sensorCard.addView(sensorHeading);
+        sensorCard.addView(cardHeader("Live line sensors", "QTR-8A  •  S1–S8"));
         sensorCard.addView(gap(8));
         sensorView = new QtrSensorView(this);
         sensorCard.addView(sensorView, full());
-        sensorInfo = txt("Waiting for verified sensor packets…", 11, MUTED, false);
+        sensorInfo = help("Waiting for sensor data…");
         sensorCard.addView(sensorInfo);
-        sensorCard.addView(gap(10));
-        calibrationInfo = txt("Saved white/black ranges: awaiting ESP32", 11, MUTED, false);
-        sensorCard.addView(calibrationInfo);
-        sensorCard.addView(gap(10));
-        Button readQtr = button("READ SAVED QTR CALIBRATION", PANEL_ALT, TEXT);
-        readQtr.setOnClickListener(v -> requestCalibrationData(true));
-        sensorCard.addView(readQtr, full());
         content.addView(sensorCard, full());
-        content.addView(gap(18));
+        content.addView(gap(12));
 
-        LinearLayout titleRow = row();
-        titleRow.addView(txt("PID TUNING", 13, TEXT, true), weighted());
-        TextView resolution = txt("0–255  /  10^divider", 11, MUTED, false);
-        titleRow.addView(resolution);
-        content.addView(titleRow, full());
-        content.addView(gap(10));
+        speed = new SpeedControl();
+        content.addView(speed.view, full());
+        return content;
+    }
 
-        kp = new PidControl("KP", "PROPORTIONAL", MINT, 1, 40, 0);
-        ki = new PidControl("KI", "INTEGRAL", BLUE, 3, 0, 0);
-        kd = new PidControl("KD", "DERIVATIVE", PURPLE, 5, 1, 0);
-        content.addView(kp.view, full()); content.addView(gap(11));
-        content.addView(ki.view, full()); content.addView(gap(11));
-        content.addView(kd.view, full()); content.addView(gap(13));
+    private TextView addTile(LinearLayout parent, String label, View.OnClickListener click) {
+        LinearLayout tile = col();
+        tile.setPadding(dp(12), dp(11), dp(12), dp(12));
+        tile.setBackground(rounded(PANEL, 16, BORDER));
+        tile.addView(txt(label, 11, MUTED, true));
+        TextView value = txt("—", 15, TEXT, true);
+        value.setSingleLine(true);
+        value.setEllipsize(TextUtils.TruncateAt.END);
+        value.setPadding(0, dp(4), 0, 0);
+        tile.addView(value);
+        if (click != null) tile.setOnClickListener(click);
+        parent.addView(tile, weighted());
+        return value;
+    }
 
-        LinearLayout autoRow = row();
-        LinearLayout autoText = col();
-        autoText.addView(txt("Live tuning", 14, TEXT, true));
-        autoText.addView(txt("Send changes on slider release", 11, MUTED, false));
-        autoRow.addView(autoText, weighted());
+    // -------------------------------------------------------------- Tune page
+
+    private LinearLayout buildTunePage() {
+        LinearLayout content = col();
+        LinearLayout intro = card();
+        intro.addView(cardHeader("PID tuning", "gain = value ÷ divider"));
+        intro.addView(gap(6));
+        intro.addView(help("Adjust each gain with − / +, the slider, or by typing a number. "
+                + "Tap Send to robot when ready, or turn on Live tuning to send every change."));
+        intro.addView(gap(12));
+        LinearLayout live = row();
+        LinearLayout liveText = col();
+        liveText.addView(txt("Live tuning", 14, TEXT, true));
+        liveText.addView(txt("Send changes to the robot instantly", 11, MUTED, false));
+        live.addView(liveText, weighted());
         liveSwitch = new Switch(this);
         liveSwitch.setThumbTintList(ColorStateList.valueOf(MINT));
         liveSwitch.setTrackTintList(ColorStateList.valueOf(BORDER));
@@ -312,289 +505,937 @@ public final class MainActivity extends Activity {
             liveTune = checked;
             preferences.edit().putBoolean("live", checked).apply();
         });
-        autoRow.addView(liveSwitch);
-        content.addView(autoRow, full());
+        live.addView(liveSwitch);
+        intro.addView(live, full());
+        content.addView(intro, full());
         content.addView(gap(12));
 
-        LinearLayout uploadButtons = row();
-        Button apply = button("APPLY ALL  ↗", MINT, BG);
+        kp = new PidControl("KP", "Proportional", "Steers back toward the line. Higher = sharper corrections.", MINT, 1, 40, 0);
+        ki = new PidControl("KI", "Integral", "Removes slow drift to one side. Usually small or 0.", BLUE, 3, 0, 0);
+        kd = new PidControl("KD", "Derivative", "Damps wobbling. Raise it if the robot oscillates.", PURPLE, 5, 1, 0);
+        content.addView(kp.view, full()); content.addView(gap(12));
+        content.addView(ki.view, full()); content.addView(gap(12));
+        content.addView(kd.view, full()); content.addView(gap(14));
+
+        LinearLayout buttons = row();
+        Button apply = button("Send to robot", MINT, BG);
         apply.setOnClickListener(v -> uploadAll());
-        uploadButtons.addView(apply, new LinearLayout.LayoutParams(0, dp(51), 1f));
-        View split = new View(this);
-        uploadButtons.addView(split, new LinearLayout.LayoutParams(dp(9), 1));
-        Button read = button("READ FROM ROBOT", PANEL_ALT, TEXT);
+        buttons.addView(apply, new LinearLayout.LayoutParams(0, dp(50), 1f));
+        buttons.addView(hgap(10));
+        Button read = button("Read from robot", PANEL_ALT, TEXT);
         read.setOnClickListener(v -> requestRobotState());
-        uploadButtons.addView(read, new LinearLayout.LayoutParams(0, dp(51), 1f));
-        content.addView(uploadButtons);
-        content.addView(gap(20));
+        buttons.addView(read, new LinearLayout.LayoutParams(0, dp(50), 1f));
+        content.addView(buttons, full());
+        return content;
+    }
 
-        speed = new SpeedControl();
-        content.addView(speed.view, full());
-        content.addView(gap(17));
+    // --------------------------------------------------------- Calibrate page
 
-        LinearLayout calCard = card();
-        calCard.addView(txt("SENSOR CALIBRATION", 13, TEXT, true));
-        calCard.addView(gap(7));
-        calCard.addView(txt("Saved to ESP32 NVS • 8-channel QTR-8A", 12, MUTED, false));
-        calCard.addView(gap(14));
-        Button recalibrate = button("RECALIBRATE SENSORS", PANEL_ALT, TEXT);
-        recalibrate.setOnClickListener(v -> confirmCalibration());
-        calCard.addView(recalibrate, full());
-        content.addView(calCard, full());
-        content.addView(gap(17));
+    private LinearLayout buildCalibratePage() {
+        LinearLayout content = col();
 
-        LinearLayout console = card();
-        LinearLayout consoleHead = row();
-        consoleHead.addView(txt("LINK CONSOLE", 12, TEXT, true), weighted());
-        sendCountLabel = txt("TX 0 B  /  RX 0 B", 10, MUTED, false);
-        consoleHead.addView(sendCountLabel);
-        console.addView(consoleHead);
-        console.addView(gap(12));
-        eventLog = txt("Waiting for ESP32…", 12, MUTED, false);
-        eventLog.setLineSpacing(dp(5), 1.0f);
-        console.addView(eventLog);
-        console.addView(gap(8));
-        linkInfo = txt("Verified frames: 0  •  CRC errors: 0  •  ignored: 0", 10, MUTED, false);
-        console.addView(linkInfo);
-        content.addView(console, full());
-        content.addView(gap(14));
-        TextView foot = txt("Protocol v3  •  CRC8 telemetry  •  BLE NUS", 11, MUTED, false);
-        foot.setGravity(Gravity.CENTER);
-        content.addView(foot);
+        LinearLayout status = card();
+        LinearLayout head = row();
+        head.addView(txt("Sensor calibration", 15, TEXT, true), weighted());
+        calBadge = txt("Unknown", 11, MUTED, true);
+        calBadge.setPadding(dp(10), dp(4), dp(10), dp(4));
+        head.addView(calBadge);
+        status.addView(head);
+        status.addView(gap(6));
+        calibrationInfo = help("Saved white/black values: waiting for robot.");
+        status.addView(calibrationInfo);
+        status.addView(gap(12));
+        Button view = button("View saved values", PANEL_ALT, TEXT);
+        view.setOnClickListener(v -> requestCalibrationData(true));
+        status.addView(view, new LinearLayout.LayoutParams(-1, dp(46)));
+        status.addView(gap(10));
+        Button restore = button("Use saved calibration", PANEL_ALT, TEXT);
+        restore.setOnClickListener(v -> restoreSavedCalibration());
+        status.addView(restore, new LinearLayout.LayoutParams(-1, dp(46)));
+        status.addView(gap(14));
+        keepOldCalSwitch = optionSwitch("Keep previous calibration if a new one fails",
+                "The robot keeps driving on the calibration saved in its memory",
+                (preferences.getInt("rule_flags", RULE_KEEP_OLD_CAL) & RULE_KEEP_OLD_CAL) != 0, status);
+        content.addView(status, full());
+        content.addView(gap(12));
 
-        // Sticky run controls, always accessible even while scrolling.
-        LinearLayout actionArea = col();
-        actionArea.setPadding(dp(18), dp(12), dp(18), dp(14));
-        actionArea.setBackground(rounded(PANEL, 18, BORDER));
-        heroStatus = txt("MOTORS DISARMED", 11, MUTED, true);
-        heroStatus.setGravity(Gravity.CENTER);
-        actionArea.addView(heroStatus);
-        actionArea.addView(gap(10));
-        LinearLayout actionRow = row();
-        startButton = button("▶  START RUN", MINT, BG);
-        stopButton = button("■  STOP NOW", RED, Color.WHITE);
-        actionRow.addView(startButton, new LinearLayout.LayoutParams(0, dp(58), 1f));
-        actionRow.addView(new View(this), new LinearLayout.LayoutParams(dp(10), 1));
-        actionRow.addView(stopButton, new LinearLayout.LayoutParams(0, dp(58), 1f));
-        startButton.setOnClickListener(v -> startRobot());
-        stopButton.setOnClickListener(v -> stopRobot());
-        actionArea.addView(actionRow);
-        screen.addView(actionArea, full());
+        LinearLayout method = card();
+        method.addView(cardHeader("Method", null));
+        method.addView(gap(10));
+        calModeSeg = new Segmented(new String[]{"Manual", "Automatic"},
+                preferences.getInt("cal_mode", 0), i -> {
+                    preferences.edit().putInt("cal_mode", i).apply();
+                    updateCalibrationPanel();
+                });
+        method.addView(calModeSeg.view, full());
 
-        kp.restore(); ki.restore(); kd.restore();
+        autoOptions = col();
+        autoOptions.addView(gap(16));
+        autoOptions.addView(txt("Movement", 13, TEXT, true));
+        autoOptions.addView(gap(8));
+        calPatternSeg = new Segmented(new String[]{"Spin in circles", "Wiggle left–right"},
+                preferences.getInt("cal_pattern", 0), i -> {
+                    preferences.edit().putInt("cal_pattern", i).apply();
+                    updateCalibrationPanel();
+                });
+        autoOptions.addView(calPatternSeg.view, full());
+        autoOptions.addView(gap(16));
+        calSeconds = new Stepper("Duration", "How long the robot moves", 1, 10,
+                preferences.getInt("cal_seconds", 3), "s", BLUE, false);
+        calSeconds.onCommit = v -> { preferences.edit().putInt("cal_seconds", v).apply(); updateCalibrationPanel(); };
+        autoOptions.addView(calSeconds.view, full());
+        autoOptions.addView(gap(14));
+        calSpeed = new Stepper("Turn speed", "Motor power while calibrating", 10, 100,
+                preferences.getInt("cal_speed", 30), "%", PURPLE, false);
+        calSpeed.onCommit = v -> preferences.edit().putInt("cal_speed", v).apply();
+        autoOptions.addView(calSpeed.view, full());
+        method.addView(autoOptions, full());
+        content.addView(method, full());
+        content.addView(gap(12));
+
+        LinearLayout steps = card();
+        steps.addView(cardHeader("How to do it", null));
+        steps.addView(gap(8));
+        calSteps = txt("", 13, TEXT, false);
+        calSteps.setLineSpacing(dp(4), 1f);
+        steps.addView(calSteps, full());
+        steps.addView(gap(14));
+        calProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        calProgress.setMax(1000);
+        calProgress.setProgressTintList(ColorStateList.valueOf(MINT));
+        calProgress.setProgressBackgroundTintList(ColorStateList.valueOf(BORDER));
+        calProgress.setVisibility(View.GONE);
+        steps.addView(calProgress, new LinearLayout.LayoutParams(-1, dp(10)));
+        calProgressText = txt("", 13, MINT, true);
+        calProgressText.setVisibility(View.GONE);
+        calProgressText.setPadding(0, dp(8), 0, dp(4));
+        steps.addView(calProgressText, full());
+        steps.addView(gap(6));
+        calStartButton = button("Start calibration", MINT, BG);
+        calStartButton.setOnClickListener(v -> startCalibration());
+        steps.addView(calStartButton, new LinearLayout.LayoutParams(-1, dp(52)));
+        content.addView(steps, full());
+
+        updateCalibrationPanel();
+        return content;
+    }
+
+    private void updateCalibrationPanel() {
+        if (calModeSeg == null || calSteps == null) return;
+        boolean manual = calModeSeg.selected() == 0;
+        autoOptions.setVisibility(manual ? View.GONE : View.VISIBLE);
+        int secs = calSeconds.get();
+        if (manual) {
+            calSteps.setText("1.  Place the sensors over WHITE, away from the line.\n"
+                    + "2.  Tap Start and keep the robot still for 2 seconds.\n"
+                    + "3.  Then slide it by hand across the black line for 5 seconds, "
+                    + "so every sensor crosses the line 3–4 times.\n"
+                    + "Motors stay off the whole time.");
+        } else if (calPatternSeg.selected() == 0) {
+            calSteps.setText("1.  Put the robot ON the black line, wheels on the floor.\n"
+                    + "2.  Tap Start. It spins in place for " + secs + " s so every sensor passes over the line.\n"
+                    + "3.  Keep hands clear. Tap Stop to cancel at any time.\n"
+                    + "Tip: give it enough time for at least one full turn.");
+        } else {
+            calSteps.setText("1.  Center the robot ON the black line, wheels on the floor.\n"
+                    + "2.  Tap Start. It rocks left and right for " + secs + " s, sweeping all sensors across the line.\n"
+                    + "3.  Keep hands clear. Tap Stop to cancel at any time.\n"
+                    + "Tip: if outer sensors fail, raise the turn speed.");
+        }
+    }
+
+    private void startCalibration() {
+        if (!connected) { showToast("Connect to the robot first"); return; }
+        if (calibrating) return;
+        if (running || startPending) { showToast("Stop the robot first"); return; }
+        blurInputs();
+        if (calModeSeg.selected() == 0) {
+            beginCalibration(new byte[]{8, 1}, 7000, true, "manual");
+            return;
+        }
+        final int secs = calSeconds.get(), power = calSpeed.get();
+        final boolean spin = calPatternSeg.selected() == 0;
+        new AlertDialog.Builder(this)
+                .setTitle(spin ? "The robot will spin" : "The robot will wiggle")
+                .setMessage("The motors will run for " + secs + " s at " + power + "% power. "
+                        + "Place the robot on the line with its wheels on the floor and keep hands clear.\n\n"
+                        + "Tap Stop to cancel at any time.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Start", (d, w) -> beginCalibration(
+                        new byte[]{15, (byte)secs, 16, (byte)power, 8, (byte)(spin ? 2 : 3)},
+                        secs * 1000L, false, spin ? "auto spin" : "auto wiggle"))
+                .show();
+    }
+
+    private void beginCalibration(byte[] command, long expectedMs, boolean manual, String label) {
+        running = false;
+        startPending = false;
+        sendBytes(command, true);
+        calibrating = true;
+        calManual = manual;
+        calStartedMs = SystemClock.uptimeMillis();
+        calExpectedMs = expectedMs;
+        calProgress.setProgress(0);
+        calProgress.setVisibility(View.VISIBLE);
+        calProgressText.setVisibility(View.VISIBLE);
+        calProgressText.setTextColor(ORANGE);
+        calStartButton.setEnabled(false);
+        calStartButton.setAlpha(0.5f);
+        addEvent("Calibration started (" + label + ").");
+        updateRunUI();
+        ui.removeCallbacks(calTicker);
+        ui.post(calTicker);
+    }
+
+    private final Runnable calTicker = new Runnable() {
+        @Override public void run() {
+            if (!calibrating) return;
+            long t = SystemClock.uptimeMillis() - calStartedMs;
+            calProgress.setProgress((int)Math.min(1000, t * 1000 / Math.max(1, calExpectedMs)));
+            long left = Math.max(0, (calExpectedMs - t + 999) / 1000);
+            String text;
+            if (t >= calExpectedMs) text = "Finishing… waiting for the robot";
+            else if (calManual && t < 2000) text = "Keep still on WHITE…  " + left + " s";
+            else if (calManual) text = "Now slide across the line…  " + left + " s";
+            else text = "Robot is moving…  " + left + " s";
+            calProgressText.setText(text);
+            if (t > calExpectedMs + 6000) {
+                finishCalibration(false, "No result from the robot. Check that the new firmware is uploaded.");
+                return;
+            }
+            ui.postDelayed(this, 100);
+        }
+    };
+
+    private void finishCalibration(boolean ok, String message) {
+        if (!calibrating) return;
+        calibrating = false;
+        ui.removeCallbacks(calTicker);
+        calProgress.setProgress(ok ? 1000 : 0);
+        calProgressText.setVisibility(View.VISIBLE);
+        calProgressText.setTextColor(ok ? GREEN : RED);
+        calProgressText.setText(message);
+        calStartButton.setEnabled(true);
+        calStartButton.setAlpha(1f);
         updateRunUI();
     }
 
-    private final class PidControl {
-        final String key, description;
-        final int color, command;
-        final LinearLayout view;
-        final TextView largeValue;
-        final SeekBar slider;
-        final EditText number;
-        final Spinner divider;
-        boolean binding = false;
+    // ------------------------------------------------------------- Rules page
 
-        PidControl(String key, String description, int color, int command, int initialNumber, int initialDivider) {
-            this.key = key; this.description = description; this.color = color; this.command = command;
-            view = card();
-            LinearLayout top = row();
-            LinearLayout lhs = col();
-            lhs.addView(txt(description, 10, MUTED, true));
-            lhs.addView(txt(key, 19, color, true));
-            top.addView(lhs, weighted());
-            largeValue = txt("0.0000", 29, TEXT, true);
-            largeValue.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
-            top.addView(largeValue);
-            view.addView(top);
-            view.addView(gap(14));
-            slider = new SeekBar(MainActivity.this);
-            slider.setMax(255);
-            slider.setProgressTintList(ColorStateList.valueOf(color));
-            slider.setThumbTintList(ColorStateList.valueOf(color));
-            slider.setProgressBackgroundTintList(ColorStateList.valueOf(BORDER));
-            view.addView(slider, full());
-            view.addView(gap(12));
-            LinearLayout bottom = row();
-            bottom.addView(txt("VALUE", 10, MUTED, true));
-            number = new EditText(MainActivity.this);
-            number.setTextColor(TEXT);
-            number.setTextSize(14);
-            number.setSingleLine(true);
-            number.setInputType(InputType.TYPE_CLASS_NUMBER);
-            number.setSelectAllOnFocus(true);
-            number.setGravity(Gravity.CENTER);
-            number.setBackground(rounded(PANEL_ALT, 9, BORDER));
-            number.setPadding(dp(8), dp(7), dp(8), dp(7));
-            LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(dp(66), dp(38));
-            nlp.setMargins(dp(9), 0, dp(14), 0);
-            bottom.addView(number, nlp);
-            bottom.addView(txt("DIVIDE BY", 10, MUTED, true));
-            divider = new Spinner(MainActivity.this);
-            final String[] options = {"1", "10", "100", "1k", "10k"};
-            ArrayAdapter<String> adapter = new ArrayAdapter<String>(MainActivity.this,
-                    android.R.layout.simple_spinner_item, options) {
-                @Override public View getView(int position, View recycled, ViewGroup parent) {
-                    TextView t = txt(options[position], 14, TEXT, true);
-                    t.setText(options[position] + "  ▾");
-                    t.setPadding(dp(10), dp(7), 0, dp(7));
-                    return t;
-                }
-                @Override public View getDropDownView(int position, View recycled, ViewGroup parent) {
-                    TextView t = txt(options[position], 15, TEXT, true);
-                    t.setBackgroundColor(PANEL_ALT);
-                    t.setPadding(dp(18), dp(13), dp(18), dp(13));
-                    return t;
-                }
-            };
-            divider.setAdapter(adapter);
-            divider.setBackground(rounded(PANEL_ALT, 9, BORDER));
-            LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(0, dp(38), 1f);
-            dlp.setMargins(dp(9), 0, 0, 0);
-            bottom.addView(divider, dlp);
-            view.addView(bottom);
-            slider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-                @Override public void onStartTrackingTouch(SeekBar sb) { }
-                @Override public void onProgressChanged(SeekBar sb, int v, boolean fromUser) {
-                    if (!fromUser || binding) return;
-                    binding = true;
-                    number.setText(String.valueOf(v));
-                    number.setSelection(number.length());
-                    binding = false;
-                    updateDisplay();
-                }
-                @Override public void onStopTrackingTouch(SeekBar sb) {
-                    saveLocal();
-                    if (liveTune) sendThisGain();
-                }
+    /** Adds a title/subtitle row with a switch to parent; changes are sent to the robot. */
+    private Switch optionSwitch(String title, String subtitle, boolean checked, LinearLayout parent) {
+        LinearLayout r = row();
+        LinearLayout names = col();
+        names.addView(txt(title, 14, TEXT, true));
+        names.addView(txt(subtitle, 11, MUTED, false));
+        r.addView(names, weighted());
+        Switch sw = new Switch(this);
+        sw.setThumbTintList(ColorStateList.valueOf(MINT));
+        sw.setTrackTintList(ColorStateList.valueOf(BORDER));
+        sw.setChecked(checked);
+        sw.setOnCheckedChangeListener((b, on) -> {
+            if (bindingRules) return;
+            saveRuleOptions();
+            sendRuleOptions(true);
+        });
+        r.addView(sw);
+        parent.addView(r, full());
+        return sw;
+    }
+
+    private LinearLayout buildRulesPage() {
+        LinearLayout content = col();
+        LinearLayout intro = card();
+        intro.addView(cardHeader("Driving rules", "saved on the robot"));
+        intro.addView(gap(6));
+        intro.addView(help("Extra behaviours on top of PID. Turn a rule on, run a test lap and compare. "
+                + "Changes are sent to the robot right away and kept after power-off."));
+        content.addView(intro, full());
+        content.addView(gap(12));
+
+        LinearLayout sharp = card();
+        int flags = preferences.getInt("rule_flags", RULE_KEEP_OLD_CAL);
+        sharpTurnSwitch = optionSwitch("Sharp turn recovery", "For 90° turns taken at high speed",
+                (flags & RULE_SHARP_TURN) != 0, sharp);
+        sharp.addView(gap(10));
+        sharp.addView(help("If the leftmost sensor (S1) sees the line and then the robot loses it, the robot "
+                + "spins left in place (right motor forward, left motor backward) until S1 finds the line "
+                + "again, then PID takes over. Same to the right with S8. "
+                + "If the line is not found within 1.5 s it goes back to normal PID search."));
+        sharp.addView(gap(14));
+        pivotSpeedStep = new Stepper("Spin speed", "Motor power while turning in place", 10, 100,
+                preferences.getInt("pivot_speed", 35), "%", MINT, true);
+        pivotSpeedStep.onCommit = v -> { saveRuleOptions(); sendRuleOptions(true); };
+        sharp.addView(pivotSpeedStep.view, full());
+        content.addView(sharp, full());
+        content.addView(gap(12));
+        content.addView(buildRouteCard(flags), full());
+        return content;
+    }
+
+    // ------------------------------------------------------ Competition route
+
+    private LinearLayout buildRouteCard(int flags) {
+        LinearLayout c = card();
+        routeSwitch = optionSwitch("Competition route", "Fire Rescue: follow the programmed steps",
+                (flags & RULE_ROUTE) != 0, c);
+        c.addView(gap(10));
+        c.addView(help("At every junction or box the robot carries out the next step below. "
+                + "Plain 90° corners (only one way to go) are turned automatically and don't use a step. "
+                + "Start the robot inside the Start box. While route mode is on, sharp turn recovery is not used."));
+        c.addView(gap(16));
+
+        c.addView(txt("Quick setup from the map", 14, TEXT, true));
+        c.addView(gap(4));
+        c.addView(help("After the reservoir, pick the turn that is NOT blocked:"));
+        c.addView(gap(8));
+        pathSeg = new Segmented(new String[]{"1st right turn", "2nd right turn"},
+                preferences.getInt("route_path", 0), i -> preferences.edit().putInt("route_path", i).apply());
+        c.addView(pathSeg.view, full());
+        c.addView(gap(14));
+        waitReservoirStep = new Stepper("Wait at water reservoir", "Blue LED turns on", 1, 15,
+                preferences.getInt("wait_reservoir", 3), "s", BLUE, false);
+        waitReservoirStep.onCommit = v -> preferences.edit().putInt("wait_reservoir", v).apply();
+        c.addView(waitReservoirStep.view, full());
+        c.addView(gap(12));
+        waitBuildingStep = new Stepper("Wait at building on fire", "Green LED turns on", 1, 15,
+                preferences.getInt("wait_building", 5), "s", GREEN, false);
+        waitBuildingStep.onCommit = v -> preferences.edit().putInt("wait_building", v).apply();
+        c.addView(waitBuildingStep.view, full());
+        c.addView(gap(12));
+        Button create = button("Create route from map", PANEL_ALT, TEXT);
+        create.setOnClickListener(v -> {
+            blurInputs();
+            buildMapRoute(pathSeg.selected() == 1, waitReservoirStep.get(), waitBuildingStep.get());
+            saveRouteLocal();
+            renderRoute();
+            showToast("Route created: " + routeSteps.size() + " steps. Check it, then send it.");
+        });
+        c.addView(create, new LinearLayout.LayoutParams(-1, dp(48)));
+        c.addView(gap(18));
+
+        LinearLayout head = row();
+        head.addView(txt("Route steps", 14, TEXT, true), weighted());
+        routeSummary = txt("", 11, MUTED, false);
+        head.addView(routeSummary);
+        c.addView(head, full());
+        c.addView(gap(4));
+        c.addView(help("Tap a step to change it, long-press to delete it."));
+        c.addView(gap(8));
+        routeListView = col();
+        c.addView(routeListView, full());
+        c.addView(gap(10));
+        LinearLayout edit = row();
+        Button add = button("Add step", PANEL_ALT, TEXT);
+        add.setOnClickListener(v -> editRouteStep(-1));
+        edit.addView(add, new LinearLayout.LayoutParams(0, dp(46), 1f));
+        edit.addView(hgap(10));
+        Button clear = button("Clear all", PANEL_ALT, TEXT);
+        clear.setOnClickListener(v -> new AlertDialog.Builder(this)
+                .setTitle("Clear all route steps?")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Clear", (d, w) -> {
+                    routeSteps.clear(); routeNotes.clear(); saveRouteLocal(); renderRoute();
+                }).show());
+        edit.addView(clear, new LinearLayout.LayoutParams(0, dp(46), 1f));
+        c.addView(edit, full());
+        c.addView(gap(16));
+
+        turnDelayStep = new Stepper("Turn delay", "Drive forward before turning, so the wheels reach the junction",
+                0, 500, preferences.getInt("turn_delay", 100), "ms", PURPLE, false);
+        turnDelayStep.onCommit = v -> preferences.edit().putInt("turn_delay", v).apply();
+        c.addView(turnDelayStep.view, full());
+        c.addView(gap(16));
+        Button send = button("Send route to robot", MINT, BG);
+        send.setOnClickListener(v -> sendRoute());
+        c.addView(send, new LinearLayout.LayoutParams(-1, dp(50)));
+
+        loadRouteLocal();
+        renderRoute();
+        return c;
+    }
+
+    private void addStep(int action, int seconds, String note) {
+        routeSteps.add(new int[]{action, seconds});
+        routeNotes.add(note);
+    }
+
+    /**
+     * Fire Rescue map (Figure 1): start in the Start box heading right.
+     * Outbound: reservoir (left branch) -> main line -> down the unblocked link ->
+     * left along the lower grid -> curve around the fire -> up the right side ->
+     * building. Return: the same path back (rulebook), mirrored.
+     */
+    private void buildMapRoute(boolean secondRight, int waitReservoir, int waitBuilding) {
+        routeSteps.clear();
+        routeNotes.clear();
+        addStep(ACT_LEFT, 0, "Water reservoir branch (on the left)");
+        addStep(ACT_WAIT_BLUE, waitReservoir, "Reservoir box: wait, blue LED on");
+        addStep(ACT_UTURN, 0, "Turn around, back down to the main line");
+        addStep(ACT_LEFT, 0, "Main line: turn toward the building");
+        if (!secondRight) {
+            addStep(ACT_RIGHT, 0, "1st right turn: down the 1st link");
+            addStep(ACT_RIGHT, 0, "Lower grid: turn right toward the curve");
+        } else {
+            addStep(ACT_STRAIGHT, 0, "Pass the 1st link (blocked)");
+            addStep(ACT_RIGHT, 0, "2nd right turn: down the 2nd link");
+            addStep(ACT_RIGHT, 0, "Lower grid: turn right toward the curve");
+            addStep(ACT_STRAIGHT, 0, "Cross the 1st link");
+        }
+        addStep(ACT_STRAIGHT, 0, "Last grid junction: straight onto the curve");
+        addStep(ACT_LEFT, 0, "Right side: branch to the building (on the left)");
+        addStep(ACT_WAIT_GREEN, waitBuilding, "Building on fire: wait, green LED on");
+        addStep(ACT_UTURN, 0, "Turn around, same path back");
+        addStep(ACT_RIGHT, 0, "Right side: turn down toward the curve");
+        addStep(ACT_STRAIGHT, 0, "First grid junction after the curve: straight");
+        if (!secondRight) {
+            addStep(ACT_LEFT, 0, "1st link: turn up");
+            addStep(ACT_LEFT, 0, "Main line: turn toward Start");
+        } else {
+            addStep(ACT_STRAIGHT, 0, "Cross the 1st link");
+            addStep(ACT_LEFT, 0, "2nd link: turn up");
+            addStep(ACT_LEFT, 0, "Main line: turn toward Start");
+            addStep(ACT_STRAIGHT, 0, "Pass the 1st link");
+        }
+        addStep(ACT_STRAIGHT, 0, "Pass the reservoir branch");
+        addStep(ACT_FINISH, 0, "Start/End box: finish");
+    }
+
+    private static String actionLabel(int action, int seconds) {
+        String name = action >= 1 && action <= 7 ? ACTION_NAMES[action] : "?";
+        if (action == ACT_WAIT_BLUE || action == ACT_WAIT_GREEN)
+            name = "Wait " + seconds + " s + " + (action == ACT_WAIT_BLUE ? "blue LED" : "green LED");
+        return name;
+    }
+
+    private void renderRoute() {
+        if (routeListView == null) return;
+        routeListView.removeAllViews();
+        if (routeSteps.isEmpty()) {
+            routeListView.addView(help("No steps yet. Tap Create route from map, or Add step."));
+        }
+        for (int i = 0; i < routeSteps.size(); i++) {
+            final int index = i;
+            int[] st = routeSteps.get(i);
+            LinearLayout item = row();
+            item.setPadding(dp(10), dp(8), dp(10), dp(8));
+            item.setBackground(rounded(BG, 12, BORDER));
+            TextView num = txt(String.valueOf(i + 1), 12, BG, true);
+            num.setGravity(Gravity.CENTER);
+            int color = st[0] == ACT_WAIT_BLUE ? BLUE : st[0] == ACT_WAIT_GREEN ? GREEN
+                    : st[0] == ACT_FINISH ? RED : st[0] == ACT_UTURN ? ORANGE : MINT;
+            num.setBackground(rounded(color, 100, 0));
+            item.addView(num, new LinearLayout.LayoutParams(dp(26), dp(26)));
+            LinearLayout texts = col();
+            texts.setPadding(dp(10), 0, 0, 0);
+            texts.addView(txt(actionLabel(st[0], st[1]), 14, TEXT, true));
+            String note = routeNotes.get(i);
+            if (!note.isEmpty()) texts.addView(txt(note, 11, MUTED, false));
+            item.addView(texts, weighted());
+            item.setOnClickListener(v -> editRouteStep(index));
+            item.setOnLongClickListener(v -> {
+                new AlertDialog.Builder(this).setTitle("Delete step " + (index + 1) + "?")
+                        .setNegativeButton("Cancel", null)
+                        .setPositiveButton("Delete", (d, w) -> {
+                            routeSteps.remove(index); routeNotes.remove(index);
+                            saveRouteLocal(); renderRoute();
+                        }).show();
+                return true;
             });
-            number.addTextChangedListener(new TextWatcher() {
-                @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
-                @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+            LinearLayout.LayoutParams lp = full();
+            lp.setMargins(0, 0, 0, dp(6));
+            routeListView.addView(item, lp);
+        }
+        updateRouteSummary();
+    }
+
+    private void updateRouteSummary() {
+        if (routeSummary == null) return;
+        String text = routeSteps.size() + " steps";
+        if (robotRouteLen >= 0) {
+            text += robotRouteLen == routeSteps.size() ? "  •  on robot" : "  •  robot has " + robotRouteLen;
+        }
+        routeSummary.setText(text);
+        routeSummary.setTextColor(robotRouteLen >= 0 && robotRouteLen != routeSteps.size() ? ORANGE : MUTED);
+    }
+
+    /** index -1 adds a new step at the end. */
+    private void editRouteStep(int index) {
+        if (index < 0 && routeSteps.size() >= MAX_ROUTE_STEPS) {
+            showToast("A route can have at most " + MAX_ROUTE_STEPS + " steps");
+            return;
+        }
+        String[] items = new String[7];
+        System.arraycopy(ACTION_NAMES, 1, items, 0, 7);
+        new AlertDialog.Builder(this)
+                .setTitle(index < 0 ? "Add step" : "Step " + (index + 1))
+                .setItems(items, (d, which) -> {
+                    int action = which + 1;
+                    if (action == ACT_WAIT_BLUE || action == ACT_WAIT_GREEN) askWaitSeconds(index, action);
+                    else applyRouteStep(index, action, 0);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void askWaitSeconds(int index, int action) {
+        EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_NUMBER);
+        int current = index >= 0 ? routeSteps.get(index)[1] : (action == ACT_WAIT_BLUE ? 3 : 5);
+        input.setText(String.valueOf(Math.max(1, current)));
+        input.setSelectAllOnFocus(true);
+        input.setGravity(Gravity.CENTER);
+        new AlertDialog.Builder(this)
+                .setTitle("Wait time (1–15 seconds)")
+                .setView(input)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("OK", (d, w) -> {
+                    int secs;
+                    try { secs = Integer.parseInt(input.getText().toString()); }
+                    catch (NumberFormatException e) { secs = 3; }
+                    applyRouteStep(index, action, Math.min(15, Math.max(1, secs)));
+                }).show();
+    }
+
+    private void applyRouteStep(int index, int action, int seconds) {
+        if (index < 0) {
+            addStep(action, seconds, "");
+        } else {
+            boolean sameAction = routeSteps.get(index)[0] == action;
+            routeSteps.set(index, new int[]{action, seconds});
+            if (!sameAction) routeNotes.set(index, "");
+        }
+        saveRouteLocal();
+        renderRoute();
+    }
+
+    private void saveRouteLocal() {
+        try {
+            org.json.JSONArray arr = new org.json.JSONArray();
+            for (int i = 0; i < routeSteps.size(); i++) {
+                org.json.JSONObject o = new org.json.JSONObject();
+                o.put("a", routeSteps.get(i)[0]);
+                o.put("s", routeSteps.get(i)[1]);
+                o.put("n", routeNotes.get(i));
+                arr.put(o);
+            }
+            preferences.edit().putString("route", arr.toString()).apply();
+        } catch (org.json.JSONException ignored) { }
+        updateRouteSummary();
+    }
+
+    private void loadRouteLocal() {
+        routeSteps.clear();
+        routeNotes.clear();
+        try {
+            org.json.JSONArray arr = new org.json.JSONArray(preferences.getString("route", "[]"));
+            for (int i = 0; i < arr.length() && i < MAX_ROUTE_STEPS; i++) {
+                org.json.JSONObject o = arr.getJSONObject(i);
+                int a = o.optInt("a", ACT_STRAIGHT);
+                if (a < 1 || a > 7) continue;
+                addStep(a, Math.min(15, Math.max(0, o.optInt("s", 0))), o.optString("n", ""));
+            }
+        } catch (org.json.JSONException ignored) { }
+    }
+
+    private void sendRoute() {
+        if (!connected) { showToast("Connect to the robot first"); return; }
+        if (running || startPending) { showToast("Stop the robot first"); return; }
+        blurInputs();
+        int n = routeSteps.size();
+        byte[] bytes = new byte[6 + 2 * n + 2];
+        int k = 0;
+        bytes[k++] = 17; bytes[k++] = (byte)ruleFlags();
+        bytes[k++] = 18; bytes[k++] = (byte)pivotSpeedStep.get();
+        bytes[k++] = 20; bytes[k++] = (byte)n;
+        for (int[] st : routeSteps) {
+            bytes[k++] = 21;
+            bytes[k++] = (byte)((st[0] << 4) | (st[1] & 0x0F));
+        }
+        bytes[k++] = 22; bytes[k] = (byte)(turnDelayStep.get() / 10);
+        sendBytes(bytes, true);
+        saveRuleOptions();
+        addEvent("Route sent: " + n + " steps, turn delay " + (turnDelayStep.get() / 10 * 10) + " ms. "
+                + (routeSwitch.isChecked() ? "Route mode is ON." : "Turn on Competition route to use it."));
+        showToast("Route sent to robot");
+        // Read the status back so the step count shows what the robot stored.
+        ui.postDelayed(() -> { if (connected) sendBytes(new byte[]{9, 0}, false); }, 600);
+    }
+
+    private int ruleFlags() {
+        int f = 0;
+        if (sharpTurnSwitch != null && sharpTurnSwitch.isChecked()) f |= RULE_SHARP_TURN;
+        if (keepOldCalSwitch != null && keepOldCalSwitch.isChecked()) f |= RULE_KEEP_OLD_CAL;
+        if (routeSwitch != null && routeSwitch.isChecked()) f |= RULE_ROUTE;
+        return f;
+    }
+
+    private void saveRuleOptions() {
+        preferences.edit().putInt("rule_flags", ruleFlags())
+                .putInt("pivot_speed", pivotSpeedStep.get()).apply();
+    }
+
+    private void sendRuleOptions(boolean log) {
+        if (!connected) return;
+        sendBytes(new byte[]{17, (byte)ruleFlags(), 18, (byte)pivotSpeedStep.get()}, true);
+        if (log) addEvent("Rules sent: sharp turn " + (sharpTurnSwitch.isChecked() ? "ON" : "OFF")
+                + " (spin " + pivotSpeedStep.get() + "%), keep previous calibration "
+                + (keepOldCalSwitch.isChecked() ? "ON" : "OFF") + ", route mode "
+                + (routeSwitch != null && routeSwitch.isChecked() ? "ON" : "OFF") + ".");
+    }
+
+    /** Robot's saved options are the source of truth once it reports them. */
+    private void applyRuleOptionsFromRobot(int flags, int pivot) {
+        bindingRules = true;
+        sharpTurnSwitch.setChecked((flags & RULE_SHARP_TURN) != 0);
+        keepOldCalSwitch.setChecked((flags & RULE_KEEP_OLD_CAL) != 0);
+        if (routeSwitch != null) routeSwitch.setChecked((flags & RULE_ROUTE) != 0);
+        bindingRules = false;
+        if (pivot >= 10 && pivot <= 100) pivotSpeedStep.set(pivot);
+        saveRuleOptions();
+    }
+
+    private void restoreSavedCalibration() {
+        if (!connected) { showToast("Connect to the robot first"); return; }
+        if (calibrating) { showToast("Wait for calibration to finish"); return; }
+        if (running || startPending) { showToast("Stop the robot first"); return; }
+        restorePending = true;
+        sendBytes(new byte[]{19, 0}, true);
+        addEvent("Asking the robot to use its saved calibration…");
+        ui.postDelayed(() -> restorePending = false, 3000);
+    }
+
+    // --------------------------------------------------------------- Log page
+
+    private LinearLayout buildLogPage() {
+        LinearLayout content = col();
+        LinearLayout activity = card();
+        LinearLayout head = row();
+        head.addView(txt("Activity", 15, TEXT, true), weighted());
+        TextView clear = txt("Clear", 13, MINT, true);
+        clear.setPadding(dp(10), dp(4), 0, dp(4));
+        clear.setOnClickListener(v -> { recentEvents.clear(); addEvent("Log cleared."); });
+        head.addView(clear);
+        activity.addView(head);
+        activity.addView(gap(10));
+        eventLog = txt("", 12, TEXT, false);
+        eventLog.setLineSpacing(dp(4), 1f);
+        eventLog.setTextIsSelectable(true);
+        activity.addView(eventLog, full());
+        content.addView(activity, full());
+        content.addView(gap(12));
+
+        LinearLayout stats = card();
+        stats.addView(cardHeader("Bluetooth link", "BLE  •  Nordic UART"));
+        stats.addView(gap(8));
+        sendCountLabel = help("TX 0 B  /  RX 0 B");
+        stats.addView(sendCountLabel);
+        linkInfo = help("CRC errors: 0  •  ignored bytes: 0");
+        stats.addView(linkInfo);
+        content.addView(stats, full());
+        content.addView(gap(14));
+        TextView foot = txt("LineForge  •  Protocol v3  •  CRC8 telemetry", 11, MUTED, false);
+        foot.setGravity(Gravity.CENTER);
+        content.addView(foot, full());
+        return content;
+    }
+
+    // -------------------------------------------------------- reusable inputs
+
+    /** Row of mutually exclusive options (like a segmented button). */
+    private final class Segmented {
+        final LinearLayout view = row();
+        private final TextView[] items;
+        private final IntListener listener;
+        private int selected;
+
+        Segmented(String[] labels, int initial, IntListener listener) {
+            this.listener = listener;
+            view.setBackground(rounded(PANEL_ALT, 12, BORDER));
+            view.setPadding(dp(3), dp(3), dp(3), dp(3));
+            items = new TextView[labels.length];
+            for (int i = 0; i < labels.length; i++) {
+                final int index = i;
+                TextView t = txt(labels[i], 13, MUTED, true);
+                t.setGravity(Gravity.CENTER);
+                t.setSingleLine(true);
+                t.setOnClickListener(v -> select(index, true));
+                items[i] = t;
+                view.addView(t, new LinearLayout.LayoutParams(0, dp(38), 1f));
+            }
+            select(Math.min(labels.length - 1, Math.max(0, initial)), false);
+        }
+
+        void select(int index, boolean notify) {
+            boolean changed = index != selected;
+            selected = index;
+            for (int i = 0; i < items.length; i++) {
+                boolean on = i == index;
+                items[i].setBackground(on ? rounded(tint(MINT, 46), 10, MINT) : null);
+                items[i].setTextColor(on ? TEXT : MUTED);
+            }
+            if (notify && changed && listener != null) listener.on(index);
+        }
+
+        int selected() { return selected; }
+    }
+
+    /**
+     * Precise number input: [−] [typed number] [+] with an optional slider.
+     * Tap −/+ for steps of 1, long-press for steps of 10.
+     */
+    private final class Stepper {
+        final LinearLayout view = col();
+        final EditText field;
+        final SeekBar slider;
+        final int min, max;
+        IntListener onChange;   // every user change (live display / constraints)
+        IntListener onCommit;   // the user finished changing the value
+        private int value;
+        private boolean binding = false;
+        private final Runnable commitTask = () -> { if (onCommit != null) onCommit.on(value); };
+
+        Stepper(String title, String hint, int min, int max, int initial, String unit, int color, boolean withSlider) {
+            this.min = min;
+            this.max = max;
+            if (title != null) {
+                LinearLayout header = row();
+                LinearLayout names = col();
+                names.addView(txt(title, 13, TEXT, true));
+                if (hint != null) names.addView(txt(hint, 11, MUTED, false));
+                header.addView(names, weighted());
+                header.addView(txt(min + "–" + max + (unit.isEmpty() ? "" : " " + unit), 11, MUTED, false));
+                view.addView(header, full());
+                view.addView(gap(8));
+            }
+            LinearLayout controls = row();
+            controls.addView(stepButton("−", -1, -10), new LinearLayout.LayoutParams(dp(48), dp(46)));
+            field = new EditText(MainActivity.this);
+            field.setTextColor(TEXT);
+            field.setTextSize(18);
+            field.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+            field.setSingleLine(true);
+            field.setInputType(InputType.TYPE_CLASS_NUMBER);
+            field.setImeOptions(EditorInfo.IME_ACTION_DONE);
+            field.setSelectAllOnFocus(true);
+            field.setGravity(Gravity.CENTER);
+            field.setBackground(rounded(BG, 12, BORDER));
+            field.setPadding(dp(6), 0, dp(6), 0);
+            LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(0, dp(46), 1f);
+            flp.setMargins(dp(8), 0, dp(8), 0);
+            controls.addView(field, flp);
+            controls.addView(stepButton("+", 1, 10), new LinearLayout.LayoutParams(dp(48), dp(46)));
+            if (!unit.isEmpty()) {
+                TextView u = txt(unit, 14, MUTED, true);
+                u.setPadding(dp(10), 0, 0, 0);
+                controls.addView(u);
+            }
+            view.addView(controls, full());
+
+            if (withSlider) {
+                slider = new SeekBar(MainActivity.this);
+                slider.setMax(max - min);
+                slider.setProgressTintList(ColorStateList.valueOf(color));
+                slider.setThumbTintList(ColorStateList.valueOf(color));
+                slider.setProgressBackgroundTintList(ColorStateList.valueOf(BORDER));
+                slider.setPadding(dp(12), dp(14), dp(12), dp(4));
+                slider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                    @Override public void onStartTrackingTouch(SeekBar sb) { blurInputs(); }
+                    @Override public void onProgressChanged(SeekBar sb, int p, boolean fromUser) {
+                        if (fromUser && !binding) userChange(min + p, -1);
+                    }
+                    @Override public void onStopTrackingTouch(SeekBar sb) { commitNow(); }
+                });
+                view.addView(slider, full());
+            } else {
+                slider = null;
+            }
+
+            field.addTextChangedListener(new TextWatcher() {
+                @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) { }
+                @Override public void onTextChanged(CharSequence s, int a, int b, int c) {
                     if (binding) return;
-                    binding = true;
-                    slider.setProgress(value());
-                    binding = false;
-                    updateDisplay();
+                    try {
+                        int v = Integer.parseInt(s.toString());
+                        if (v >= Stepper.this.min && v <= Stepper.this.max) {
+                            value = v;
+                            syncSlider();
+                            if (onChange != null) onChange.on(value);
+                        }
+                    } catch (NumberFormatException ignored) { }
                 }
                 @Override public void afterTextChanged(Editable s) { }
             });
-            number.setOnFocusChangeListener((v, focused) -> {
+            field.setOnEditorActionListener((v, action, event) -> {
+                if (action == EditorInfo.IME_ACTION_DONE) { blurInputs(); return true; }
+                return false;
+            });
+            field.setOnFocusChangeListener((v, focused) -> {
                 if (!focused) {
-                    setData(value(), divisor());
-                    saveLocal();
-                    if (liveTune) sendThisGain();
+                    int typed;
+                    try { typed = Integer.parseInt(field.getText().toString()); }
+                    catch (NumberFormatException e) { typed = value; }
+                    userChange(typed, -1);
+                    apply(value); // show the clamped number
+                    commitNow();
                 }
             });
-            divider.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
-                @Override public void onNothingSelected(android.widget.AdapterView<?> p) { }
-                @Override public void onItemSelected(android.widget.AdapterView<?> p, View v, int position, long id) {
-                    updateDisplay();
-                    if (binding) return;
-                    saveLocal();
-                    // Never auto-send divider on initial spinner binding.
-                    if (liveTune && divider.getTag() != null) sendThisGain();
-                    divider.setTag("bound");
-                }
-            });
-            setData(initialNumber, initialDivider);
+            apply(initial);
         }
 
-        int value() {
-            try { return Math.min(255, Math.max(0, Integer.parseInt(number.getText().toString()))); }
-            catch (Exception e) { return 0; }
+        private TextView stepButton(String label, int step, int bigStep) {
+            TextView b = txt(label, 22, TEXT, true);
+            b.setGravity(Gravity.CENTER);
+            b.setBackground(rounded(PANEL_ALT, 12, BORDER));
+            b.setOnClickListener(v -> { blurInputs(); userChange(value + step, 450); });
+            b.setOnLongClickListener(v -> { blurInputs(); userChange(value + bigStep, 450); return true; });
+            return b;
         }
-        int divisor() { return Math.min(4, Math.max(0, divider.getSelectedItemPosition())); }
-        void setData(int numerator, int divisor) {
+
+        int get() { return value; }
+
+        /** Programmatic update: no listeners fire. */
+        void set(int v) { apply(v); }
+
+        private void apply(int v) {
+            value = Math.min(max, Math.max(min, v));
             binding = true;
-            int v = Math.min(255, Math.max(0, numerator));
-            int d = Math.min(4, Math.max(0, divisor));
-            number.setText(String.valueOf(v));
-            slider.setProgress(v);
-            divider.setSelection(d);
+            String s = String.valueOf(value);
+            if (!field.getText().toString().equals(s)) field.setText(s);
+            syncSlider();
             binding = false;
+        }
+
+        private void syncSlider() {
+            if (slider == null) return;
+            boolean was = binding;
+            binding = true;
+            slider.setProgress(value - min);
+            binding = was;
+        }
+
+        /** User-driven change; commitDelayMs &lt; 0 means "wait for an explicit commit". */
+        private void userChange(int v, int commitDelayMs) {
+            int before = value;
+            apply(v);
+            if (value != before && onChange != null) onChange.on(value);
+            ui.removeCallbacks(commitTask);
+            if (commitDelayMs >= 0) ui.postDelayed(commitTask, commitDelayMs);
+        }
+
+        private void commitNow() {
+            ui.removeCallbacks(commitTask);
+            commitTask.run();
+        }
+    }
+
+    // ------------------------------------------------------------ PID + speed
+
+    private final class PidControl {
+        final String key;
+        final int command;
+        final LinearLayout view;
+        final TextView largeValue;
+        final Stepper number;
+        final Segmented divider;
+
+        PidControl(String key, String name, String description, int color, int command,
+                   int initialNumber, int initialDivider) {
+            this.key = key;
+            this.command = command;
+            view = card();
+            LinearLayout top = row();
+            LinearLayout lhs = col();
+            lhs.addView(txt(key, 20, color, true));
+            lhs.addView(txt(name, 12, MUTED, true));
+            top.addView(lhs, weighted());
+            largeValue = txt("0.0000", 28, TEXT, true);
+            largeValue.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+            top.addView(largeValue);
+            view.addView(top, full());
+            view.addView(gap(4));
+            view.addView(help(description));
+            view.addView(gap(14));
+
+            number = new Stepper(null, null, 0, 255, initialNumber, "", color, true);
+            number.onChange = v -> updateDisplay();
+            number.onCommit = v -> { saveLocal(); if (liveTune) sendThisGain(); };
+            view.addView(number.view, full());
+            view.addView(gap(12));
+            view.addView(txt("Divide by", 12, MUTED, true));
+            view.addView(gap(6));
+            divider = new Segmented(new String[]{"÷1", "÷10", "÷100", "÷1k", "÷10k"}, initialDivider, i -> {
+                updateDisplay();
+                saveLocal();
+                if (liveTune) sendThisGain();
+            });
+            view.addView(divider.view, full());
             updateDisplay();
         }
-        void updateDisplay() {
-            double value = value() / Math.pow(10.0, divisor());
-            largeValue.setText(String.format(Locale.US, "%.4f", value));
+
+        int value() { return number.get(); }
+        int divisor() { return Math.min(4, Math.max(0, divider.selected())); }
+
+        void setData(int numerator, int divisor) {
+            number.set(numerator);
+            divider.select(Math.min(4, Math.max(0, divisor)), false);
+            updateDisplay();
         }
+
+        double gain() { return value() / Math.pow(10.0, divisor()); }
+
+        void updateDisplay() {
+            largeValue.setText(String.format(Locale.US, "%.4f", gain()));
+            refreshStatusTiles();
+        }
+
         void restore() {
             int defNum = command == 1 ? 40 : command == 5 ? 1 : 0;
             setData(preferences.getInt(key + "_v", defNum), preferences.getInt(key + "_d", 0));
         }
+
         void saveLocal() {
             preferences.edit().putInt(key + "_v", value()).putInt(key + "_d", divisor()).apply();
         }
+
         void sendThisGain() {
             if (!connected) return;
             sendBytes(new byte[]{(byte)command, (byte)value(), (byte)(command + 1), (byte)divisor()}, true);
-            addEvent(key + " updated: " + largeValue.getText());
+            addEvent(key + " sent: " + largeValue.getText());
         }
     }
 
     /** Motor speed (% of full PWM): command 13 = base speed, 14 = max speed. */
     private final class SpeedControl {
         final LinearLayout view = card();
-        private SeekBar baseBar, maxBar;
-        private final TextView baseLabel, maxLabel;
+        final Stepper baseStep, maxStep;
 
         SpeedControl() {
-            LinearLayout head = row();
-            head.addView(txt("MOTOR SPEED", 13, TEXT, true), weighted());
-            head.addView(txt("% of full power", 11, MUTED, false));
-            view.addView(head);
+            view.addView(cardHeader("Motor speed", "% of full power"));
             view.addView(gap(12));
-            baseLabel = txt("", 13, TEXT, true);
-            maxLabel = txt("", 13, TEXT, true);
-            baseBar = slider(ORANGE);
-            maxBar = slider(RED);
-            view.addView(baseLabel);
-            view.addView(baseBar, full());
+            baseStep = new Stepper("Base speed", "Cruising speed on the line", 0, 100,
+                    preferences.getInt("speed_base", 25), "%", ORANGE, true);
+            maxStep = new Stepper("Max speed", "Fastest any wheel may turn", 0, 100,
+                    preferences.getInt("speed_max", 30), "%", RED, true);
+            // Base speed can never be above max speed.
+            baseStep.onChange = v -> { if (v > maxStep.get()) maxStep.set(v); refreshStatusTiles(); };
+            maxStep.onChange = v -> { if (v < baseStep.get()) baseStep.set(v); refreshStatusTiles(); };
+            baseStep.onCommit = v -> { saveLocal(); send(true); };
+            maxStep.onCommit = v -> { saveLocal(); send(true); };
+            view.addView(baseStep.view, full());
+            view.addView(gap(16));
+            view.addView(maxStep.view, full());
             view.addView(gap(10));
-            view.addView(maxLabel);
-            view.addView(maxBar, full());
-            view.addView(gap(8));
-            view.addView(txt("Sent when you release a slider. START gives a 180 ms kick at max speed.", 11, MUTED, false));
-            setData(preferences.getInt("speed_base", 25), preferences.getInt("speed_max", 30));
+            view.addView(help("Changes are sent to the robot right away. Start gives a short kick at max speed."));
         }
 
-        private SeekBar slider(int color) {
-            SeekBar s = new SeekBar(MainActivity.this);
-            s.setMax(100);
-            s.setProgressTintList(ColorStateList.valueOf(color));
-            s.setThumbTintList(ColorStateList.valueOf(color));
-            s.setProgressBackgroundTintList(ColorStateList.valueOf(BORDER));
-            s.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-                @Override public void onStartTrackingTouch(SeekBar sb) { }
-                @Override public void onProgressChanged(SeekBar sb, int v, boolean fromUser) {
-                    if (!fromUser) return;
-                    // Base speed can never be above max speed.
-                    if (sb == baseBar && v > maxBar.getProgress()) maxBar.setProgress(v);
-                    if (sb == maxBar && v < baseBar.getProgress()) baseBar.setProgress(v);
-                    updateLabels();
-                }
-                @Override public void onStopTrackingTouch(SeekBar sb) {
-                    saveLocal();
-                    send(true);
-                }
-            });
-            return s;
-        }
-
-        int base() { return baseBar.getProgress(); }
-        int max() { return maxBar.getProgress(); }
+        int base() { return baseStep.get(); }
+        int max() { return maxStep.get(); }
 
         void setData(int base, int max) {
-            int m = Math.min(100, Math.max(0, max));
-            maxBar.setProgress(m);
-            baseBar.setProgress(Math.min(m, Math.max(0, base)));
-            updateLabels();
-        }
-
-        void updateLabels() {
-            baseLabel.setText("Base speed   " + base() + "%");
-            maxLabel.setText("Max speed   " + max() + "%");
+            maxStep.set(max);
+            baseStep.set(Math.min(maxStep.get(), base));
+            refreshStatusTiles();
         }
 
         void saveLocal() {
@@ -608,17 +1449,51 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private void refreshStatusTiles() {
+        if (calTileValue == null) return;
+        String calText;
+        int calColor;
+        if (calibrating) { calText = "Calibrating"; calColor = ORANGE; }
+        else if (!connected) { calText = "—"; calColor = MUTED; }
+        else if (calibrationValid) { calText = "Ready"; calColor = GREEN; }
+        else if (queryReceived) { calText = "Needed"; calColor = RED; }
+        else { calText = "Checking…"; calColor = MUTED; }
+        calTileValue.setText(calText);
+        calTileValue.setTextColor(calColor);
+        if (calBadge != null) {
+            calBadge.setText(calText.equals("—") ? "Offline" : calText);
+            calBadge.setTextColor(calColor);
+            calBadge.setBackground(rounded(tint(calColor, 40), 20, 0));
+        }
+        if (kp != null && ki != null && kd != null) {
+            pidTileValue.setText(String.format(Locale.US, "%s · %s · %s",
+                    shortNumber(kp.gain()), shortNumber(ki.gain()), shortNumber(kd.gain())));
+        }
+        if (speed != null) speedTileValue.setText(speed.base() + " / " + speed.max() + "%");
+    }
+
+    private static String shortNumber(double v) {
+        if (v == Math.rint(v)) return String.valueOf((long)v);
+        String s = String.format(Locale.US, "%.4f", v);
+        while (s.endsWith("0")) s = s.substring(0, s.length() - 1);
+        return s;
+    }
+
+    // --------------------------------------------------------------- actions
+
     private void uploadAll() {
-        if (!connected) { showToast("Connect your ESP32 first"); return; }
+        if (!connected) { showToast("Connect to the robot first"); return; }
         blurInputs();
         byte[] values = new byte[]{
                 1, (byte)kp.value(), 2, (byte)kp.divisor(),
                 3, (byte)ki.value(), 4, (byte)ki.divisor(),
                 5, (byte)kd.value(), 6, (byte)kd.divisor(),
-                13, (byte)speed.base(), 14, (byte)speed.max()};
-        kp.saveLocal(); ki.saveLocal(); kd.saveLocal(); speed.saveLocal();
+                13, (byte)speed.base(), 14, (byte)speed.max(),
+                17, (byte)ruleFlags(), 18, (byte)pivotSpeedStep.get()};
+        kp.saveLocal(); ki.saveLocal(); kd.saveLocal(); speed.saveLocal(); saveRuleOptions();
         sendBytes(values, true);
-        addEvent("Sent PID + speed settings (16 bytes). NVS will save after 2 s.");
+        addEvent("Sent PID, speed and rule settings. The robot saves them after 2 s.");
+        showToast("Sent to robot");
     }
 
     private void blurInputs() {
@@ -631,15 +1506,19 @@ public final class MainActivity extends Activity {
     }
 
     private void startRobot() {
-        if (!connected) { showToast("Connect ESP32 first"); return; }
+        if (!connected) { showToast("Connect to the robot first"); return; }
+        if (calibrating) { showToast("Wait for calibration to finish"); return; }
         if (queryReceived && !calibrationValid) {
-            showToast("Calibrate QTR-8A before starting"); return;
+            showToast("Calibrate the sensors first");
+            showTab(TAB_CALIBRATE);
+            return;
         }
+        blurInputs();
         startPending = true;
         running = false;
         sendBytes(new byte[]{7, 1}, true);
         updateRunUI();
-        addEvent("START sent; waiting for verified ESP32 motor status…");
+        addEvent("START sent; waiting for the robot to confirm…");
         ui.postDelayed(() -> {
             if (connected && startPending) {
                 startPending = false;
@@ -648,7 +1527,7 @@ public final class MainActivity extends Activity {
                 // Do not assume the robot stopped just because its reply was lost.
                 // Explicit STOP as well as the firmware heartbeat timeout.
                 sendBytes(new byte[]{7, 0}, false);
-                addEvent("NO START CONFIRMATION: STOP sent. Check BLE link, power and firmware.");
+                addEvent("No START confirmation: STOP sent. Check the BLE link, power and firmware.");
             }
         }, 2500);
     }
@@ -658,51 +1537,43 @@ public final class MainActivity extends Activity {
         running = false;
         updateRunUI();
         if (connected) sendBytes(new byte[]{7, 0}, true);
-        addEvent("STOP requested; waiting for ESP32 status.");
+        addEvent(calibrating ? "STOP sent: cancelling calibration…" : "STOP sent.");
     }
 
     private void updateRunUI() {
         if (heroStatus == null) return;
-        heroStatus.setText(startPending ? "START SENT  •  AWAITING ESP32" :
-                running ? "RUNNING  •  CONFIRMED BY ESP32" : "MOTORS DISARMED");
-        heroStatus.setTextColor(startPending ? ORANGE : running ? MINT : MUTED);
-        if (startButton != null) startButton.setAlpha(connected && !running && !startPending ? 1f : 0.55f);
-        if (stopButton != null) stopButton.setAlpha(connected ? 1f : 0.7f);
-        if (running || startPending) getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        String status;
+        int color;
+        if (!connected) { status = "Not connected"; color = MUTED; }
+        else if (calibrating) { status = "Calibrating sensors…"; color = ORANGE; }
+        else if (startPending) { status = "Starting… waiting for robot"; color = ORANGE; }
+        else if (running) { status = "●  Running"; color = GREEN; }
+        else { status = "Motors off  •  ready"; color = MUTED; }
+        heroStatus.setText(status);
+        heroStatus.setTextColor(color);
+        if (startButton != null) startButton.setAlpha(connected && !running && !startPending && !calibrating ? 1f : 0.45f);
+        if (stopButton != null) stopButton.setAlpha(connected ? 1f : 0.6f);
+        if (running || startPending || calibrating) getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         else getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-    }
-
-    private void confirmCalibration() {
-        if (!connected) { showToast("Connect the ESP32 first"); return; }
-        new AlertDialog.Builder(this)
-                .setTitle("Recalibrate QTR-8A?")
-                .setMessage("Place the robot on WHITE before proceeding. Once started, leave it still for 2 seconds, then sweep all 8 sensors across the black line for 5 seconds. The motors will stay stopped. Successful values are saved to NVS.")
-                .setNegativeButton("Cancel", null)
-                .setPositiveButton("Start calibration", (dialog, which) -> {
-                    running = false;
-                    startPending = false;
-                    updateRunUI();
-                    sendBytes(new byte[]{8, 1}, true);
-                    addEvent("Calibrating: 2 s white + 5 s sweep. Awaiting result…");
-                }).show();
+        refreshStatusTiles();
     }
 
     private void requestRobotState() {
-        if (!connected) { showToast("Connect the ESP32 first"); return; }
+        if (!connected) { showToast("Connect to the robot first"); return; }
         queryReceived = false;
         sendBytes(new byte[]{9, 0}, true);
-        addEvent("Requesting actual PID values from the ESP32…");
+        addEvent("Reading settings from the robot…");
         ui.postDelayed(() -> {
             if (connected && !queryReceived)
-                addEvent("No verified ESP32 status: check that the firmware feeds NUS RX writes to its command parser and replies via TX notify; also check power and motor-triggered resets.");
+                addEvent("No reply from the robot. Make sure the LineForge BLE firmware is uploaded; also check power.");
         }, 2300);
     }
 
     private void requestCalibrationData(boolean showDialog) {
-        if (!connected) { showToast("Connect ESP32 first"); return; }
+        if (!connected) { showToast("Connect to the robot first"); return; }
         calibrationDialogPending = showDialog;
         sendBytes(new byte[]{12, 0}, true);
-        if (showDialog) addEvent("Requesting eight saved white/black calibration pairs…");
+        if (showDialog) addEvent("Reading saved calibration values…");
     }
 
     // ------------------------------------------------------------ BLE permissions
@@ -858,13 +1729,21 @@ public final class MainActivity extends Activity {
     }
 
     private void showConnectingUI(String name, String label) {
-        connectionLabel.setText(label);
-        connectionLabel.setTextColor(ORANGE);
-        connectionDot.setBackground(rounded(ORANGE, 100, 0));
+        setStatusChip(label, ORANGE);
         if (name != null) selectedDevice.setText(name);
+        connectHint.setText("Keep the robot switched on and close to the phone.");
         connectButton.setEnabled(true);
         connectButton.setText("Cancel");
+        connectButton.setTextColor(TEXT);
+        connectButton.setBackground(rounded(PANEL_ALT, 14, BORDER));
         updateRunUI();
+    }
+
+    private void setStatusChip(String label, int color) {
+        connectionLabel.setText(label);
+        connectionLabel.setTextColor(color);
+        connectionDot.setBackground(rounded(color, 100, 0));
+        statusChip.setBackground(rounded(tint(color, 34), 20, tint(color, 90)));
     }
 
     private void updateCounters() {
@@ -874,8 +1753,8 @@ public final class MainActivity extends Activity {
     // All BleUartClient callbacks arrive on the main thread.
     private final BleUartClient.Callback bleCallback = new BleUartClient.Callback() {
         @Override public void onConnecting(String name, int attempt, int maxRetries) {
-            showConnectingUI(name, attempt == 0 ? "CONNECTING…" :
-                    "RECONNECTING " + attempt + "/" + maxRetries + "…");
+            showConnectingUI(name, attempt == 0 ? "Connecting…" :
+                    "Reconnecting " + attempt + "/" + maxRetries);
         }
         @Override public void onReady(String name, int mtu) {
             int epoch = session.incrementAndGet();
@@ -893,7 +1772,7 @@ public final class MainActivity extends Activity {
             resetLinkState();
             String safety = wasConnected ? " Robot stops via ESP32 heartbeat timeout." : "";
             if (willRetry) {
-                showConnectingUI(name, "RECONNECTING…");
+                showConnectingUI(name, "Reconnecting…");
                 addEvent((wasConnected ? "BLE link lost: " : "Connection attempt failed: ") + reason +
                         ". Retrying automatically…" + safety);
             } else {
@@ -952,26 +1831,70 @@ public final class MainActivity extends Activity {
 
     private void handleReply(int b) {
         if (b == 0x06) return;
+        if (b == 0x15 && restorePending) {
+            restorePending = false;
+            addEvent("The robot has no saved calibration to use. Run a new calibration.");
+            showToast("No saved calibration on the robot");
+            return;
+        }
         if (b == 0x15) {
-            addEvent("ESP32 rejected a command. Check calibration and firmware protocol.");
+            addEvent("The robot rejected a command. Check calibration and firmware version.");
             if (startPending) {
                 startPending = false;
                 running = false;
                 updateRunUI();
             }
+            if (calibrating && SystemClock.uptimeMillis() - calStartedMs < 1500)
+                finishCalibration(false, "The robot refused to calibrate. Upload the latest firmware and try again.");
             return;
         }
         if (b == 0xC1) {
             calibrationValid = true;
-            addEvent("QTR calibration successful. Saved to NVS.");
+            addEvent("Calibration successful. Saved on the robot.");
+            finishCalibration(true, "✓  Calibration successful, saved on the robot");
+            updateRunUI();
             ui.postDelayed(() -> { requestRobotState(); requestCalibrationData(false); }, 350);
             return;
         }
         if (b == 0xC0) {
             calibrationValid = false; running = false; startPending = false;
-            updateRunUI(); addEvent("Calibration failed. Motors disabled."); return;
+            calFailedAtMs = SystemClock.uptimeMillis();
+            finishCalibration(false, "✗  Calibration failed: some sensors never saw the line. Try again.");
+            updateRunUI(); addEvent("Calibration failed. Motors disabled until calibrated."); return;
         }
-        if (b == 0xC2) { calibrationValid = true; addEvent("Saved QTR calibration loaded."); return; }
+        if (b == 0xC2) {
+            calibrationValid = true;
+            // Sent at boot, or when a calibration is cancelled with STOP.
+            if (calibrating) {
+                finishCalibration(false, "Calibration cancelled. The previous calibration is kept.");
+                addEvent("Calibration cancelled; previous calibration kept.");
+            } else if (restorePending) {
+                restorePending = false;
+                addEvent("Robot is now using its saved calibration.");
+                showToast("Saved calibration in use");
+                calProgressText.setVisibility(View.VISIBLE);
+                calProgressText.setTextColor(GREEN);
+                calProgressText.setText("✓  Using the saved calibration");
+            } else if (SystemClock.uptimeMillis() - calFailedAtMs < 3000) {
+                addEvent("New calibration failed; the robot keeps using its previous calibration.");
+                calProgressText.setVisibility(View.VISIBLE);
+                calProgressText.setTextColor(ORANGE);
+                calProgressText.setText("New calibration failed, so the previous saved calibration is still in use.");
+            } else addEvent("Saved calibration loaded.");
+            updateRunUI();
+            return;
+        }
+        if (b == 0xE1) {
+            running = false; startPending = false; updateRunUI();
+            addEvent("Route complete: the robot reached the finish.");
+            showToast("Route complete");
+            return;
+        }
+        if (b == 0xE0) {
+            running = false; startPending = false; updateRunUI();
+            addEvent("Route stopped: a turn did not find the line. Check the steps and the turn delay.");
+            return;
+        }
         if (b == 0xD1) {
             running = false; startPending = false; updateRunUI();
             addEvent("Safety stop: no valid heartbeat at ESP32."); return;
@@ -981,19 +1904,25 @@ public final class MainActivity extends Activity {
     private void receivePacket(int type, byte[] payload) {
         if (type == Protocol.STATUS && payload.length >= 8) {
             receiveStateFrame(payload, true);
-        } else if (type == Protocol.SENSORS && payload.length == 13) {
+        } else if (type == Protocol.SENSORS && payload.length >= 13) {
             int[] samples = new int[8];
             for (int i=0;i<8;i++) samples[i] = payload[i] & 255;
             int pos = (payload[8] & 255) | ((payload[9] & 255) << 8);
             int flags = payload[10] & 255;
             boolean seen = (flags & 1) != 0;
             boolean cal = (flags & 8) != 0;
+            boolean pivot = (flags & 16) != 0;
             sensorView.update(samples, pos, seen, cal);
             int l = (int)payload[11], r = (int)payload[12];
             sensorInfo.setText(cal ? "Calibration running • raw reflectance levels" :
+                    pivot ? "Sharp turn recovery: spinning to find the line" :
                     seen ? String.format(Locale.US, "Line position %.2f / 7   •   Left %+d%%   Right %+d%%",
                             pos / 1000.0, l, r) :
                             "LINE LOST  •  Motors L " + l + "%  R " + r + "%");
+            if (payload.length >= 16 && routeSwitch != null && routeSwitch.isChecked() && (running || startPending)) {
+                int done = payload[13] & 255, total = payload[14] & 255;
+                sensorInfo.setText("Route step " + done + " of " + total + "   •   " + sensorInfo.getText());
+            }
         } else if (type == Protocol.CALIBRATION && payload.length == 32) {
             StringBuilder b = new StringBuilder();
             int minRange = Integer.MAX_VALUE;
@@ -1033,6 +1962,17 @@ public final class MainActivity extends Activity {
             int base = data[8] & 255, max = data[9] & 255;
             if (base <= 100 && max <= 100) { speed.setData(base, max); speed.saveLocal(); }
         }
+        if (framed && data.length >= 12 && sharpTurnSwitch != null)
+            applyRuleOptionsFromRobot(data[10] & 255, data[11] & 255);
+        if (framed && data.length >= 14 && turnDelayStep != null) {
+            robotRouteLen = data[12] & 255;
+            int delay10 = data[13] & 255;
+            if (delay10 <= 50) {
+                turnDelayStep.set(delay10 * 10);
+                preferences.edit().putInt("turn_delay", delay10 * 10).apply();
+            }
+            updateRouteSummary();
+        }
         calibrationValid=(flags & 1)!=0;
         boolean wasPending=startPending;
         running=(flags & 2)!=0;
@@ -1053,13 +1993,15 @@ public final class MainActivity extends Activity {
     }
 
     private void updateConnectionUI(boolean active, String name) {
-        connectionLabel.setText(active ? "CONNECTED" : "OFFLINE");
-        connectionLabel.setTextColor(active ? MINT : RED);
-        connectionDot.setBackground(rounded(active ? MINT : RED, 100, 0));
+        setStatusChip(active ? "Connected" : "Offline", active ? GREEN : RED);
         if (name != null) selectedDevice.setText(name);
-        else if (!active) selectedDevice.setText("No ESP32 connected");
+        else if (!active) selectedDevice.setText("No robot connected");
+        connectHint.setText(active ? "Connected over Bluetooth Low Energy."
+                : "Switch on the robot, then tap Connect.");
         connectButton.setEnabled(true);
-        connectButton.setText(active ? "Disconnect ESP32" : "Scan for ESP32 (BLE)");
+        connectButton.setText(active ? "Disconnect" : "Connect to robot");
+        connectButton.setTextColor(active ? TEXT : BG);
+        connectButton.setBackground(active ? rounded(PANEL_ALT, 14, BORDER) : rounded(MINT, 14, 0));
         updateRunUI();
     }
 
@@ -1072,6 +2014,7 @@ public final class MainActivity extends Activity {
         queryReceived = false;
         connected = false;
         if (sensorView != null) sensorView.setConnected(false);
+        if (calibrating) finishCalibration(false, "Connection lost during calibration. Reconnect and check the result.");
     }
 
     /** User-initiated disconnect (or app shutdown): no automatic reconnection. */
@@ -1083,13 +2026,15 @@ public final class MainActivity extends Activity {
 
     private void addEvent(String s) {
         lastEvent = s;
-        recentEvents.addFirst(s);
-        while (recentEvents.size() > 5) recentEvents.removeLast();
+        String time = new java.text.SimpleDateFormat("HH:mm:ss", Locale.US).format(new java.util.Date());
+        recentEvents.addFirst(time + "   " + s);
+        while (recentEvents.size() > MAX_EVENTS) recentEvents.removeLast();
+        if (lastEventLabel != null) lastEventLabel.setText(s);
         if (eventLog != null) {
             StringBuilder b = new StringBuilder();
             for (String e : recentEvents) {
                 if (b.length() > 0) b.append("\n\n");
-                b.append("• ").append(e);
+                b.append(e);
             }
             eventLog.setText(b.toString());
         }

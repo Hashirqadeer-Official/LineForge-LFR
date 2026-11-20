@@ -79,7 +79,8 @@ public final class Protocol {
         }
         private static boolean recognizedReply(int b) {
             return b == 0x06 || b == 0x15 || b == 0xC0 ||
-                   b == 0xC1 || b == 0xC2 || b == 0xD1;
+                   b == 0xC1 || b == 0xC2 || b == 0xD1 ||
+                   b == 0xE0 || b == 0xE1;   // route stopped / finished
         }
         private void parse() {
             while (count > 0) {
