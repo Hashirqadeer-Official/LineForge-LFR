@@ -15,6 +15,7 @@ public final class QtrSensorView extends View {
     private final float[] target = new float[8];
     private float currentPosition = 3.5f;
     private float targetPosition = 3.5f;
+    private int positionValue = -1;     // 0..7000, -1 = line not seen
     private boolean lineSeen = false;
     private boolean calibration = false;
     private boolean online = false;
@@ -29,13 +30,14 @@ public final class QtrSensorView extends View {
     }
     private float dp(float px) { return getResources().getDisplayMetrics().density * px; }
     @Override protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
-        int h = (int)dp(215);
+        int h = (int)dp(232);
         setMeasuredDimension(resolveSize((int)dp(270), widthMeasureSpec), resolveSize(h, heightMeasureSpec));
     }
     public void setConnected(boolean b) { online = b; invalidate(); }
     public void update(int[] normalized, int position1000, boolean seesLine, boolean calibrating) {
         for (int i = 0; i < 8; i++) target[i] = Math.min(1f, Math.max(0f, normalized[i]/255f));
         if (position1000 >= 0 && position1000 <= 7000) targetPosition = position1000/1000f;
+        positionValue = (seesLine && position1000 >= 0 && position1000 <= 7000) ? position1000 : -1;
         lineSeen = seesLine;
         calibration = calibrating;
         online = true;
@@ -60,7 +62,13 @@ public final class QtrSensorView extends View {
         canvas.drawText(!fresh ? "NO LIVE DATA" : calibration ? "CALIBRATING • RAW SIGNAL" : lineSeen ? "LINE DETECTED" : "LINE LOST", dp(2), dp(18), brush);
         brush.setTypeface(android.graphics.Typeface.create("sans-serif", 0));
         brush.setColor(dim); brush.setTextSize(dp(10));
-        String label = fresh ? "8 Hz telemetry" : "Waiting for valid packets";
+        String label = !fresh ? "Waiting for valid packets"
+                : (positionValue >= 0 && !calibration) ? "Position " + positionValue + " / 7000" : "8 Hz telemetry";
+        if (fresh && positionValue >= 0 && !calibration) {
+            brush.setColor(fg);
+            brush.setTextSize(dp(12));
+            brush.setTypeface(android.graphics.Typeface.create("sans-serif-medium", 1));
+        }
         canvas.drawText(label, w - brush.measureText(label) - dp(2), dp(18), brush);
         final float left = dp(2), right = w - dp(2), gap = dp(7);
         final float cell = (right-left-gap*7)/8;
@@ -84,6 +92,11 @@ public final class QtrSensorView extends View {
             brush.setColor(dim); brush.setTextSize(dp(9));
             String level=Integer.toString(Math.round(target[i]*100));
             canvas.drawText(level,x+(cell-brush.measureText(level))/2,dp(200),brush);
+            // Line position scale: each sensor sits at 0, 1000 … 7000.
+            brush.setTextSize(dp(8));
+            brush.setColor(i == 3 || i == 4 ? mint : dim);
+            String at = Integer.toString(i * 1000);
+            canvas.drawText(at, x + (cell - brush.measureText(at)) / 2, dp(222), brush);
         }
         currentPosition += (targetPosition-currentPosition)*0.24f;
         if (fresh && lineSeen && !calibration) {

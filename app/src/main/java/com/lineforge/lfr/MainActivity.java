@@ -82,10 +82,11 @@ public final class MainActivity extends Activity {
     private static final int P_LINE_THRESHOLD = 1, P_SHARP_TIMEOUT = 2, P_SHARP_END = 3,
             P_IR_TRIGGER = 4, P_IR_SPEED = 5, P_IR_TIMEOUT = 6, P_IR_END = 7, P_IR_DEBOUNCE = 8,
             P_INVERT_MODE = 9, P_INVERT_DARK = 10, P_INVERT_CONFIRM = 11, P_GAP_MIN = 12,
-            P_BOX_DETECT = 13, P_ARM = 14, P_TURN_TIMEOUT = 15, P_JUNCTION_GAP = 16, PARAM_COUNT = 16;
+            P_BOX_DETECT = 13, P_ARM = 14, P_TURN_TIMEOUT = 15, P_JUNCTION_GAP = 16,
+            P_EDGE_ZONE = 17, P_SHARP_STOP = 18, P_IR_END_SENSOR = 19, PARAM_COUNT = 19;
     /** App unit (%, ms) = firmware value x scale. */
-    private static final int[] PARAM_SCALE = {1, 10, 100, 1, 1, 1, 100, 1, 1, 1, 1, 10, 10, 10, 10, 100, 10};
-    private static final int[] PARAM_DEFAULT = {0, 50, 15, 0, 0, 35, 15, 1, 0, 0, 6, 10, 5, 25, 15, 30, 30};
+    private static final int[] PARAM_SCALE = {1, 10, 100, 1, 1, 1, 100, 1, 1, 1, 1, 10, 10, 10, 10, 100, 10, 100, 100, 1};
+    private static final int[] PARAM_DEFAULT = {0, 50, 15, 0, 0, 35, 15, 1, 0, 0, 6, 10, 5, 25, 15, 30, 30, 5, 10, 0};
     // Route actions shared with the firmware (command 21: action << 4 | seconds).
     private static final int ACT_LEFT = 1, ACT_RIGHT = 2, ACT_STRAIGHT = 3, ACT_UTURN = 4,
             ACT_WAIT_BLUE = 5, ACT_WAIT_GREEN = 6, ACT_FINISH = 7;
@@ -884,7 +885,8 @@ public final class MainActivity extends Activity {
         });
         head.addView(reset);
         c.addView(head, full());
-        c.addView(help("Counted since START. Future rules can act on these numbers."));
+        c.addView(help("Counted since START, every detection instantly (no time limits). "
+                + "Future rules can act on these numbers."));
         c.addView(gap(10));
         String[] names = {"IR left", "IR right", "Junctions", "Left turns", "Right turns", "Gaps"};
         for (int r = 0; r < 2; r++) {
@@ -900,10 +902,6 @@ public final class MainActivity extends Activity {
         c.addView(gap(10));
         lineModeLabel = help("Line: waiting for robot…");
         c.addView(lineModeLabel, full());
-        LinearLayout adv = collapsible(c, "Counting settings");
-        adv.addView(paramStepper(P_GAP_MIN, "Gap", "Line lost at least this long counts as a gap", 1, 100, "ms", BLUE).view, full());
-        adv.addView(gap(12));
-        adv.addView(paramStepper(P_JUNCTION_GAP, "Junction spacing", "Ignore a second junction sooner than this", 5, 100, "ms", BLUE).view, full());
         return c;
     }
 
@@ -943,20 +941,28 @@ public final class MainActivity extends Activity {
 
         // Sharp turn recovery (QTR outer sensors)
         LinearLayout sharp = card();
-        sharpTurnSwitch = optionSwitch("Sharp turn recovery", "QTR outer sensors • 90° turns at speed",
+        sharpTurnSwitch = optionSwitch("Sharp turn recovery", "QTR line position • 90° turns at speed",
                 (flags & RULE_SHARP_TURN) != 0, sharp);
         sharp.addView(gap(8));
-        sharp.addView(help("S1 (leftmost) sees the line, then the robot loses it → spin left in place "
-                + "(right motor forward, left backward) until the line is found, then PID continues. S8 mirrors it."));
+        sharp.addView(help("Line position goes 0 (under S1, far left) → 3500 (center) → 7000 (under S8, far right). "
+                + "If the line was in the left edge zone and then the robot loses it → spin left in place "
+                + "(right motor forward, left backward) until the line is back near the center, then PID continues. "
+                + "The right edge mirrors it."));
         sharp.addView(gap(12));
         pivotSpeedStep = new Stepper("Spin speed", "Motor power while turning in place", 10, 100,
                 preferences.getInt("pivot_speed", 35), "%", MINT, true);
         pivotSpeedStep.onCommit = v -> { saveRuleOptions(); sendRuleOptions(true); };
         sharp.addView(pivotSpeedStep.view, full());
+        sharp.addView(gap(14));
+        sharp.addView(paramStepper(P_EDGE_ZONE, "Edge zone",
+                "Line at position ≤ this (left) or ≥ 7000 − this (right) counts as at the edge",
+                1, 30, "", BLUE).view, full());
+        sharp.addView(gap(14));
+        sharp.addView(paramStepper(P_SHARP_STOP, "Stop when within ± of center",
+                "Spin stops when the line position is within this distance of 3500 "
+                + "(e.g. 1000 = between 2500 and 4500). 3500 = stop as soon as the line appears.",
+                0, 35, "", BLUE).view, full());
         LinearLayout sharpAdv = collapsible(sharp, "More settings");
-        sharpAdv.addView(label("Stop spinning when"));
-        sharpAdv.addView(paramSeg(P_SHARP_END, new String[]{"Outer sensor sees line", "Center sees line"}).view, full());
-        sharpAdv.addView(gap(12));
         sharpAdv.addView(paramStepper(P_SHARP_TIMEOUT, "Give up after",
                 "Back to normal PID if the line isn't found", 1, 50, "ms", ORANGE).view, full());
         content.addView(sharp, full());
@@ -970,23 +976,16 @@ public final class MainActivity extends Activity {
         irLiveLabel = txt("IR-L  ○      IR-R  ○", 13, MUTED, true);
         ir.addView(irLiveLabel, full());
         ir.addView(gap(6));
-        ir.addView(help("IR-L sees the line → spin left (right motor forward, left backward) until the line is "
-                + "found, then PID continues. IR-R mirrors it. Detections are always counted on the Drive tab."));
+        ir.addView(help("IR-R detects → turn right with both wheels (left forward, right backward). The moment the "
+                + "IR detects the line again, PID takes over. IR-L mirrors it. No time limits: every detection "
+                + "counts, however short. Detections are always counted on the Drive tab."));
         ir.addView(label("Start turning"));
         ir.addView(paramSeg(P_IR_TRIGGER, new String[]{"When line is lost", "Immediately"}).view, full());
         ir.addView(gap(12));
-        ir.addView(paramStepper(P_IR_SPEED, "Spin speed", "Motor power while turning in place",
+        ir.addView(paramStepper(P_IR_SPEED, "Turn speed", "Motor power on both wheels while turning",
                 10, 100, "%", MINT).view, full());
-        LinearLayout irAdv = collapsible(ir, "More settings");
-        irAdv.addView(label("Stop spinning when"));
-        irAdv.addView(paramSeg(P_IR_END, new String[]{"Outer sensor sees line", "Center sees line"}).view, full());
-        irAdv.addView(gap(12));
-        irAdv.addView(paramStepper(P_IR_TIMEOUT, "Give up after",
-                "Back to normal PID if the line isn't found", 1, 50, "ms", ORANGE).view, full());
-        irAdv.addView(gap(12));
-        irAdv.addView(paramStepper(P_IR_DEBOUNCE, "Repeat filter",
-                "0 = record every detection, even very short ones. Raise only if one line counts twice.",
-                0, 255, "ms", PURPLE).view, full());
+        ir.addView(label("Stop turning (PID starts) when"));
+        ir.addView(paramSeg(P_IR_END_SENSOR, new String[]{"Same IR detects again", "Either IR detects"}).view, full());
         content.addView(ir, full());
         content.addView(gap(12));
 
@@ -2161,8 +2160,8 @@ public final class MainActivity extends Activity {
             int l = (int)payload[11], r = (int)payload[12];
             sensorInfo.setText(cal ? "Calibration running • raw reflectance levels" :
                     pivot ? "Sharp turn recovery: spinning to find the line" :
-                    seen ? String.format(Locale.US, "Line position %.2f / 7   •   Left %+d%%   Right %+d%%",
-                            pos / 1000.0, l, r) :
+                    seen ? String.format(Locale.US, "Position %d  (0 left · 3500 center · 7000 right)   •   L %+d%%  R %+d%%",
+                            pos, l, r) :
                             "LINE LOST  •  Motors L " + l + "%  R " + r + "%");
             if (payload.length >= 16 && routeSwitch != null && routeSwitch.isChecked() && (running || startPending)) {
                 int done = payload[13] & 255, total = payload[14] & 255;

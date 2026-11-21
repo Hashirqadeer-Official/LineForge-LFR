@@ -129,21 +129,24 @@ const int MIN_CAL_RANGE = 300;          // raw 12-bit ADC counts
 // Stored value is one byte; the comment gives its unit. Saved in NVS.
 const uint8_t P_LINE_THRESHOLD = 1;     // x10 = calibrated level (0..1000) that counts as black
 const uint8_t P_SHARP_TIMEOUT = 2;      // x100 ms: sharp turn gives up
-const uint8_t P_SHARP_END = 3;          // 0 = stop when outer sensor finds line, 1 = center
+const uint8_t P_SHARP_END = 3;          // (unused, replaced by P_SHARP_STOP)
 const uint8_t P_IR_TRIGGER = 4;         // 0 = turn when line is lost, 1 = turn immediately
 const uint8_t P_IR_SPEED = 5;           // % spin speed for the IR turn
-const uint8_t P_IR_TIMEOUT = 6;         // x100 ms: IR turn gives up
-const uint8_t P_IR_END = 7;             // 0 = stop when outer sensor finds line, 1 = center
-const uint8_t P_IR_DEBOUNCE = 8;        // ms: ignore a repeat detection sooner than this (0 = record all)
+const uint8_t P_IR_TIMEOUT = 6;         // (unused: the IR turn has no time settings)
+const uint8_t P_IR_END = 7;             // (unused, replaced by P_IR_END_SENSOR)
+const uint8_t P_IR_DEBOUNCE = 8;        // (unused: every IR detection is recorded)
 const uint8_t P_INVERT_MODE = 9;        // 0 = normal line, 1 = auto detect, 2 = always inverted
 const uint8_t P_INVERT_DARK = 10;       // sensors that must be dark to switch (auto)
 const uint8_t P_INVERT_CONFIRM = 11;    // x10 ms the pattern must last before switching
-const uint8_t P_GAP_MIN = 12;           // x10 ms of lost line that counts as a gap
+const uint8_t P_GAP_MIN = 12;           // (unused: any lost-then-found line is a gap)
 const uint8_t P_BOX_DETECT = 13;        // x10 ms whole array dark = inside a box (route)
 const uint8_t P_ARM = 14;               // x10 ms centered line before the next junction (route)
 const uint8_t P_TURN_TIMEOUT = 15;      // x100 ms route turn gives up
-const uint8_t P_JUNCTION_GAP = 16;      // x10 ms minimum time between counted junctions
-const uint8_t PARAM_COUNT = 16;
+const uint8_t P_JUNCTION_GAP = 16;      // (unused: every junction is counted)
+const uint8_t P_EDGE_ZONE = 17;         // x100: line position <= this (or >= 7000 - this) = at the edge
+const uint8_t P_SHARP_STOP = 18;        // x100: sharp turn stops when the line is within +/- this of 3500
+const uint8_t P_IR_END_SENSOR = 19;     // IR turn stops (PID starts) at: 0 = same IR detects again, 1 = either IR
+const uint8_t PARAM_COUNT = 19;
 struct ParamDef { uint8_t minV, maxV, def; };
 const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
   {0, 0, 0},       // 0 unused
@@ -162,7 +165,10 @@ const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
   {5, 100, 25},    // 13 box detect 250 ms
   {5, 100, 15},    // 14 arm 150 ms
   {5, 100, 30},    // 15 route turn timeout 3 s
-  {5, 100, 30},    // 16 junction spacing 300 ms
+  {5, 100, 30},    // 16 (unused)
+  {1, 30, 5},      // 17 edge zone: position <= 500 / >= 6500
+  {0, 35, 10},     // 18 sharp stop: within +/-1000 of center
+  {0, 1, 0},       // 19 IR stops at: same IR detects again
 };
 uint8_t params[PARAM_COUNT + 1];
 uint8_t selectedParam = 0;
@@ -340,6 +346,8 @@ uint32_t pivotStartMs = 0;
 const uint8_t RULE_IR_TURN = 0x08;
 const uint8_t SRC_SHARP = 0, SRC_IR = 1;
 uint8_t pivotSource = SRC_SHARP;         // which rule started the current spin
+bool pivotLeftLine = false;             // sharp turn: the line has left the array during the spin
+const uint32_t IR_TURN_FAILSAFE_MS = 5000;  // safety only: never reached in a normal turn
 
 // ---- Side IR sensors ----
 bool irLeftActive = false, irRightActive = false;   // debounced: sees black
@@ -347,7 +355,6 @@ bool irLeftRose = false, irRightRose = false;       // new detection, for rules
 // Every detection is caught by a hardware interrupt, so even a very short
 // pulse is recorded while the main loop is busy; updateIR() handles them.
 volatile uint16_t irLeftPending = 0, irRightPending = 0;
-volatile uint32_t irLeftIsrMs = 0, irRightIsrMs = 0;
 portMUX_TYPE irMux = portMUX_INITIALIZER_UNLOCKED;
 void irLeftIsr();    // declared here: Arduino does not auto-declare IRAM_ATTR functions
 void irRightIsr();
@@ -368,7 +375,7 @@ RunCounters counters = {};
 // Flags: set when the event happens, cleared on START / reset.
 bool flagGap = false, flagJunction = false, flagLeftTurn = false, flagRightTurn = false;
 bool flagIrLeft = false, flagIrRight = false;
-uint32_t lineLostSinceMs = 0, lastJunctionMs = 0;
+bool lineWasLost = false;
 bool junctionActive = false;
 
 // ---- Competition route (option bit 2) ----
@@ -1506,8 +1513,7 @@ void resetCounters() {
   counters = RunCounters();
   flagGap = flagJunction = flagLeftTurn = flagRightTurn = false;
   flagIrLeft = flagIrRight = false;
-  lineLostSinceMs = 0;
-  lastJunctionMs = 0;
+  lineWasLost = false;
   junctionActive = false;
   irEdge = 0;
 }
@@ -1530,25 +1536,16 @@ void sendParamsFrame() {
 }
 
 // IR interrupt handlers: run the instant a sensor starts seeing black.
+// No time filter: every detection is recorded, however short.
 void IRAM_ATTR irLeftIsr() {
-  const uint32_t now = millis();
-  const uint8_t filter = params[P_IR_DEBOUNCE];
   portENTER_CRITICAL_ISR(&irMux);
-  if (filter == 0 || now - irLeftIsrMs >= filter) {
-    if (irLeftPending < 65535) irLeftPending = irLeftPending + 1;
-    irLeftIsrMs = now;
-  }
+  if (irLeftPending < 65535) irLeftPending = irLeftPending + 1;
   portEXIT_CRITICAL_ISR(&irMux);
 }
 
 void IRAM_ATTR irRightIsr() {
-  const uint32_t now = millis();
-  const uint8_t filter = params[P_IR_DEBOUNCE];
   portENTER_CRITICAL_ISR(&irMux);
-  if (filter == 0 || now - irRightIsrMs >= filter) {
-    if (irRightPending < 65535) irRightPending = irRightPending + 1;
-    irRightIsrMs = now;
-  }
+  if (irRightPending < 65535) irRightPending = irRightPending + 1;
   portEXIT_CRITICAL_ISR(&irMux);
 }
 
@@ -1599,28 +1596,22 @@ void updateInversion(const int *cal) {
 }
 
 // Counts junctions (both sides dark) and gaps (line lost, then found again
-// without a recovery spin) while driving.
+// without a recovery turn). Purely value based, no time windows, so nothing
+// is missed at high speed.
 void updateLineEvents(const int *cal, int32_t total) {
   const int thr = EDGE_THRESHOLD;
   int dark = 0;
   for (int s = 0; s < 8; ++s) if (cal[s] > thr) dark++;
   const bool bothSides = cal[0] > thr && cal[1] > thr && cal[6] > thr && cal[7] > thr;
   const bool junction = bothSides || dark >= 7;
-  const uint32_t now = millis();
-  if (junction && !junctionActive &&
-      now - lastJunctionMs >= (uint32_t)params[P_JUNCTION_GAP] * 10U) {
-    robotEvent(EV_JUNCTION);
-    lastJunctionMs = now;
-  }
+  if (junction && !junctionActive) robotEvent(EV_JUNCTION);
   junctionActive = junction;
 
   if (total == 0) {
-    if (lineLostSinceMs == 0) lineLostSinceMs = now;
+    lineWasLost = true;
   } else {
-    if (lineLostSinceMs != 0 && pivotDir == 0 && routeState == RS_FOLLOW &&
-        now - lineLostSinceMs >= (uint32_t)params[P_GAP_MIN] * 10U)
-      robotEvent(EV_GAP);
-    lineLostSinceMs = 0;
+    if (lineWasLost && pivotDir == 0 && routeState == RS_FOLLOW) robotEvent(EV_GAP);
+    lineWasLost = false;
   }
 }
 
@@ -1634,35 +1625,49 @@ void startPivot(int8_t dir, uint8_t source) {
 }
 
 // ---------------- Rules: sharp-turn recovery + IR turn ----------------
-// Sharp turn (QTR): if S1 (leftmost) or S8 (rightmost) saw the line and then
-// the whole array loses it, spin in place toward that side.
-// IR turn: same idea with the side IR sensors; it can also turn immediately
-// when an IR sensor detects the line (setting P_IR_TRIGGER).
-// Spin left = right motor forward, left motor backward (and mirrored).
-// The spin ends when the outer sensor on that side (or the center, per the
-// setting) finds the line, or after the timeout; then PID resumes.
-// Returns true while spinning (PID skipped this cycle).
+// QTR line position: 0 = line under S1 (far left), 3500 = center,
+// 7000 = line under S8 (far right).
+//
+// Sharp turn (QTR): if the line was in the left edge zone (position <= edge
+// zone) and then the whole array loses it, spin left in place (right motor
+// forward, left motor backward); right edge mirrored. The spin stops when
+// the line is back within +/- the stop window of the center (spinning left
+// the line enters at S1 and moves right, so stop at position >= 3500 - window).
+//
+// IR turn: IR-R detection -> turn right with both wheels (left forward,
+// right backward); IR-L mirrored. It starts when the line is lost or
+// immediately (setting) and ends the moment the IR detects the line again
+// (same IR, or either IR - setting); then PID continues at once.
+// Returns true while turning (PID skipped this cycle).
 bool edgeTurnRules(const int *cal, int32_t weighted, int32_t total) {
+  (void)cal;
   const bool sharpOn = (ruleFlags & RULE_SHARP_TURN) != 0;
   const bool irOn = (ruleFlags & RULE_IR_TURN) != 0;
   const bool leftRose = irLeftRose, rightRose = irRightRose;
   irLeftRose = irRightRose = false;
   if (!sharpOn && !irOn) { pivotDir = 0; return false; }
 
-  const int thr = EDGE_THRESHOLD;
-  const bool leftOuter = cal[0] > thr;
-  const bool rightOuter = cal[7] > thr;
-  const bool center = cal[3] > thr || cal[4] > thr;
+  const bool seen = total > 0;
+  const int32_t pos = seen ? weighted * 1000 / total : -1;   // 0..7000
+  const int32_t zone = (int32_t)params[P_EDGE_ZONE] * 100;
 
   if (pivotDir != 0) {
-    const bool fromIR = pivotSource == SRC_IR;
-    const bool useCenter = (fromIR ? params[P_IR_END] : params[P_SHARP_END]) != 0;
-    const bool found = useCenter ? center : (pivotDir < 0 ? leftOuter : rightOuter);
-    const uint32_t limit = (uint32_t)(fromIR ? params[P_IR_TIMEOUT] : params[P_SHARP_TIMEOUT]) * 100U;
-    const bool timedOut = (uint32_t)(millis() - pivotStartMs) > limit;
+    bool found;
+    bool timedOut;
+    if (pivotSource == SRC_IR) {
+      found = params[P_IR_END_SENSOR] == 1 ? (leftRose || rightRose)
+                                           : (pivotDir < 0 ? leftRose : rightRose);
+      timedOut = (uint32_t)(millis() - pivotStartMs) > IR_TURN_FAILSAFE_MS;
+    } else {
+      if (!seen) pivotLeftLine = true;
+      const int32_t window = (int32_t)params[P_SHARP_STOP] * 100;
+      found = pivotLeftLine && seen &&
+              (pivotDir < 0 ? pos >= 3500 - window : pos <= 3500 + window);
+      timedOut = (uint32_t)(millis() - pivotStartMs) > PIVOT_TIMEOUT_MS;
+    }
     if (found || timedOut) {
-      Serial.println(found ? "Turn finished: line found, PID resumes"
-                           : "Turn timeout: PID search resumes");
+      if (found) Serial.printf("Turn finished (line position %ld), PID resumes\n", (long)pos);
+      else Serial.println("Turn safety limit reached, PID resumes");
       pivotDir = 0;
       lastEdge = 0;
       irEdge = 0;
@@ -1670,39 +1675,41 @@ bool edgeTurnRules(const int *cal, int32_t weighted, int32_t total) {
       iTerm = 0.0f;
       return false;
     }
-    const int speedPct = fromIR ? params[P_IR_SPEED] : pivotSpeed;
+    const int speedPct = pivotSource == SRC_IR ? params[P_IR_SPEED] : pivotSpeed;
     const int pwm = speedPct * 255 / 100;
     setMotors(pivotDir < 0 ? -pwm : pwm, pivotDir < 0 ? pwm : -pwm);
     return true;
   }
 
-  const bool centered = total > 0 && !leftOuter && !rightOuter &&
-                        fabsf((float)weighted / (float)total - 3.5f) < CENTERED_ERROR;
+  const bool leftEdge = seen && pos <= zone;
+  const bool rightEdge = seen && pos >= 7000 - zone;
+  const bool centered = seen && abs((int)(pos - 3500)) < (int)(CENTERED_ERROR * 1000.0f);
 
-  // Sharp turn memory: which outer QTR sensor saw the line last.
+  // Sharp turn memory: on which edge the line was last seen.
   if (sharpOn) {
-    if (leftOuter && !rightOuter) lastEdge = -1;
-    else if (rightOuter && !leftOuter) lastEdge = 1;
+    if (leftEdge) lastEdge = -1;
+    else if (rightEdge) lastEdge = 1;
     else if (centered) lastEdge = 0;
   }
-  // IR memory: which side IR saw the line last (kept until it clears again).
+  // IR memory: which side IR detected last (any detection, however short).
   if (irOn) {
-    if (leftRose && !rightRose) irEdge = -1;        // even a very short detection
+    if (leftRose && !rightRose) irEdge = -1;
     else if (rightRose && !leftRose) irEdge = 1;
-    if (irLeftActive && !irRightActive) irEdge = -1;
+    else if (irLeftActive && !irRightActive) irEdge = -1;
     else if (irRightActive && !irLeftActive) irEdge = 1;
     else if (centered && !irLeftActive && !irRightActive) irEdge = 0;
   }
 
   if (irOn && params[P_IR_TRIGGER] == 1 && (leftRose != rightRose)) {
     startPivot(leftRose ? -1 : 1, SRC_IR);       // turn immediately on detection
-  } else if (total == 0 && sharpOn && lastEdge != 0) {
+  } else if (!seen && sharpOn && lastEdge != 0) {
     startPivot(lastEdge, SRC_SHARP);
-  } else if (total == 0 && irOn && irEdge != 0) {
+  } else if (!seen && irOn && irEdge != 0) {
     startPivot(irEdge, SRC_IR);
   } else {
     return false;
   }
+  pivotLeftLine = !seen;
   const int speedPct = pivotSource == SRC_IR ? params[P_IR_SPEED] : pivotSpeed;
   const int pwm = speedPct * 255 / 100;
   setMotors(pivotDir < 0 ? -pwm : pwm, pivotDir < 0 ? pwm : -pwm);
