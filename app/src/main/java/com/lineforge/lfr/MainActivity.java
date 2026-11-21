@@ -83,10 +83,11 @@ public final class MainActivity extends Activity {
             P_IR_TRIGGER = 4, P_IR_SPEED = 5, P_IR_TIMEOUT = 6, P_IR_END = 7, P_IR_DEBOUNCE = 8,
             P_INVERT_MODE = 9, P_INVERT_DARK = 10, P_INVERT_CONFIRM = 11, P_GAP_MIN = 12,
             P_BOX_DETECT = 13, P_ARM = 14, P_TURN_TIMEOUT = 15, P_JUNCTION_GAP = 16,
-            P_EDGE_ZONE = 17, P_SHARP_STOP = 18, P_IR_END_SENSOR = 19, PARAM_COUNT = 19;
+            P_EDGE_ZONE = 17, P_SHARP_STOP = 18, P_IR_END_SENSOR = 19,
+            P_LEFT_TRIM = 20, P_RIGHT_TRIM = 21, PARAM_COUNT = 21;
     /** App unit (%, ms) = firmware value x scale. */
-    private static final int[] PARAM_SCALE = {1, 10, 100, 1, 1, 1, 100, 1, 1, 1, 1, 10, 10, 10, 10, 100, 10, 100, 100, 1};
-    private static final int[] PARAM_DEFAULT = {0, 50, 15, 0, 0, 35, 15, 1, 0, 0, 6, 10, 5, 25, 15, 30, 30, 5, 10, 0};
+    private static final int[] PARAM_SCALE = {1, 10, 100, 1, 1, 1, 100, 1, 1, 1, 1, 10, 10, 10, 10, 100, 10, 100, 100, 1, 1, 1};
+    private static final int[] PARAM_DEFAULT = {0, 50, 15, 0, 0, 35, 15, 1, 0, 0, 6, 10, 5, 25, 15, 30, 30, 5, 10, 0, 100, 100};
     // Route actions shared with the firmware (command 21: action << 4 | seconds).
     private static final int ACT_LEFT = 1, ACT_RIGHT = 2, ACT_STRAIGHT = 3, ACT_UTURN = 4,
             ACT_WAIT_BLUE = 5, ACT_WAIT_GREEN = 6, ACT_FINISH = 7;
@@ -1661,6 +1662,38 @@ public final class MainActivity extends Activity {
             view.addView(maxStep.view, full());
             view.addView(gap(10));
             view.addView(help("Changes are sent to the robot right away. Start gives a short kick at max speed."));
+            view.addView(gap(18));
+            view.addView(txt("Wheel balance", 14, TEXT, true));
+            view.addView(gap(2));
+            view.addView(help("If one wheel is faster, the robot drifts and turns better to one side. "
+                    + "Lower the faster motor (or raise the slower one) until it drives straight. "
+                    + "100% = unchanged. Applies to everything the motor does."));
+            view.addView(gap(12));
+            view.addView(paramStepper(P_LEFT_TRIM, "Left motor", "Power of the left wheel",
+                    50, 150, "%", BLUE).view, full());
+            view.addView(gap(12));
+            view.addView(paramStepper(P_RIGHT_TRIM, "Right motor", "Power of the right wheel",
+                    50, 150, "%", PURPLE).view, full());
+            view.addView(gap(12));
+            LinearLayout testRow = row();
+            Button test = button("Drive straight 2 s", PANEL_ALT, TEXT);
+            test.setOnClickListener(v -> {
+                if (!connected) { showToast("Connect to the robot first"); return; }
+                if (running || startPending) { showToast("Stop the robot first"); return; }
+                blurInputs();
+                // Send the current speed and trims first so the test uses them.
+                sendBytes(new byte[]{13, (byte)base(), 14, (byte)max(),
+                        23, (byte)P_LEFT_TRIM, 24, (byte)paramValue(P_LEFT_TRIM),
+                        23, (byte)P_RIGHT_TRIM, 24, (byte)paramValue(P_RIGHT_TRIM), 28, 2}, true);
+                addEvent("Wheel test: driving straight for 2 s at base speed (no PID). "
+                        + "Watch which way it drifts. Stop cancels it.");
+            });
+            testRow.addView(test, new LinearLayout.LayoutParams(0, dp(46), 1f));
+            testRow.addView(hgap(10));
+            Button resetTrim = button("Reset 100%", PANEL_ALT, TEXT);
+            resetTrim.setOnClickListener(v -> { setParam(P_LEFT_TRIM, 100); setParam(P_RIGHT_TRIM, 100); });
+            testRow.addView(resetTrim, new LinearLayout.LayoutParams(0, dp(46), 1f));
+            view.addView(testRow, full());
         }
 
         int base() { return baseStep.get(); }

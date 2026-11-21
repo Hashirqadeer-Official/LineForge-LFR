@@ -53,6 +53,7 @@
     Settings (every rule's thresholds/timeouts, saved in NVS):
     [23,id] select setting id (see PARAM table)   [24,value] set it
     [26,0] send all settings (frame type 54)      [27,0] reset counters
+    [28,s] wheel-balance test: drive straight at base speed for s seconds (1..10), no PID
     Type 54: settings, one byte per setting id 1..PARAM_COUNT.
     Type 55: counters: IR-L count u16, IR-R count u16, junctions, left turns,
              right turns, gaps, flags (bit0 IR-L sees black, bit1 IR-R,
@@ -146,7 +147,9 @@ const uint8_t P_JUNCTION_GAP = 16;      // (unused: every junction is counted)
 const uint8_t P_EDGE_ZONE = 17;         // x100: line position <= this (or >= 7000 - this) = at the edge
 const uint8_t P_SHARP_STOP = 18;        // x100: sharp turn stops when the line is within +/- this of 3500
 const uint8_t P_IR_END_SENSOR = 19;     // IR turn stops (PID starts) at: 0 = same IR detects again, 1 = either IR
-const uint8_t PARAM_COUNT = 19;
+const uint8_t P_LEFT_TRIM = 20;         // % of commanded power for the LEFT motor (balance the wheels)
+const uint8_t P_RIGHT_TRIM = 21;        // % of commanded power for the RIGHT motor
+const uint8_t PARAM_COUNT = 21;
 struct ParamDef { uint8_t minV, maxV, def; };
 const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
   {0, 0, 0},       // 0 unused
@@ -169,6 +172,8 @@ const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
   {1, 30, 5},      // 17 edge zone: position <= 500 / >= 6500
   {0, 35, 10},     // 18 sharp stop: within +/-1000 of center
   {0, 1, 0},       // 19 IR stops at: same IR detects again
+  {50, 150, 100},  // 20 left motor trim 100 %
+  {50, 150, 100},  // 21 right motor trim 100 %
 };
 uint8_t params[PARAM_COUNT + 1];
 uint8_t selectedParam = 0;
@@ -346,6 +351,7 @@ uint32_t pivotStartMs = 0;
 const uint8_t RULE_IR_TURN = 0x08;
 const uint8_t SRC_SHARP = 0, SRC_IR = 1;
 uint8_t pivotSource = SRC_SHARP;         // which rule started the current spin
+uint32_t straightTestEndMs = 0;         // wheel-balance test running until this time (0 = off)
 bool pivotLeftLine = false;             // sharp turn: the line has left the array during the spin
 const uint32_t IR_TURN_FAILSAFE_MS = 5000;  // safety only: never reached in a normal turn
 
@@ -715,6 +721,9 @@ void driveMotor(int in1, int in2, int pwmPin, int speed) {
 }
 
 void setMotors(int left, int right) {
+  // Wheel balance: scale each motor so both wheels really turn at the same speed.
+  left = constrain(left * (int)params[P_LEFT_TRIM] / 100, -255, 255);
+  right = constrain(right * (int)params[P_RIGHT_TRIM] / 100, -255, 255);
   lastMotorLeft = left; lastMotorRight = right;
   driveMotor(AIN1, AIN2, PWMA, left);
   driveMotor(BIN1, BIN2, PWMB, right);
@@ -722,6 +731,7 @@ void setMotors(int left, int right) {
 
 void stopRobot() {
   startPulseActive = false;
+  straightTestEndMs = 0;
   pivotDir = 0;
   lastEdge = 0;
   routeState = RS_FOLLOW;
@@ -841,7 +851,7 @@ void sendStatusFrame() {
 void readBluetooth() {
   while (BT.available() >= 2) {
     int cmd = BT.peek();
-    if (cmd < 1 || cmd > 27) {
+    if (cmd < 1 || cmd > 28) {
       BT.read();  // skip invalid leading byte
       continue;
     }
@@ -866,7 +876,8 @@ void readBluetooth() {
         (cmd == 23 && (val < 1 || val > PARAM_COUNT)) ||
         (cmd == 25) ||
         (cmd == 26 && val != 0) ||
-        (cmd == 27 && val != 0)) {
+        (cmd == 27 && val != 0) ||
+        (cmd == 28 && (val < 1 || val > 10))) {
       BT.write(NAK);
       continue;
     }
@@ -889,6 +900,15 @@ void readBluetooth() {
       continue;
     }
     if (cmd == 26) { sendParamsFrame(); continue; }
+    if (cmd == 28) {
+      if (robotOn || calibrating || calibrationPending) { BT.write(NAK); continue; }
+      straightTestEndMs = millis() + (uint32_t)val * 1000U;
+      if (straightTestEndMs == 0) straightTestEndMs = 1;
+      Serial.printf("Wheel test: straight at base speed for %d s (trim L %d%% R %d%%)\n",
+                    val, params[P_LEFT_TRIM], params[P_RIGHT_TRIM]);
+      BT.write(ACK);
+      continue;
+    }
     if (cmd == 27) { resetCounters(); BT.write(ACK); sendCountersFrame(); continue; }
 
     if (cmd >= 20 && cmd <= 22) {
@@ -1720,6 +1740,7 @@ void loop() {
   updateIR();
   if (BT.takeLinkDropped()) {
     telemetryEnabled = false;
+    if (straightTestEndMs != 0) { straightTestEndMs = 0; setMotors(0, 0); }
     if (REQUIRE_APP_HEARTBEAT && robotOn) {
       stopRobot();
       Serial.println("Safety stop: BLE connection lost");
@@ -1753,6 +1774,17 @@ void loop() {
       (lastSaveAttemptMs == 0 ||
        (uint32_t)(millis() - lastSaveAttemptMs) >= 5000U)) {
     savePID();
+  }
+
+  if (straightTestEndMs != 0) {
+    if ((int32_t)(millis() - straightTestEndMs) >= 0) {
+      straightTestEndMs = 0;
+      setMotors(0, 0);
+      Serial.println("Wheel test finished");
+    } else {
+      setMotors(basePwm(), basePwm());   // no PID: shows any drift
+    }
+    return;
   }
 
   if (!calOk || !robotOn) return; // stopRobot() already set zero duty
