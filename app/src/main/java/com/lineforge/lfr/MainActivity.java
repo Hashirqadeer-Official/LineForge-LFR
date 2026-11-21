@@ -156,6 +156,7 @@ public final class MainActivity extends Activity {
     private final ArrayList<int[]> routeSteps = new ArrayList<>();   // {action, seconds}
     private final ArrayList<String> routeNotes = new ArrayList<>();
     private int robotRouteLen = -1;
+    private boolean resetWarningShown = false;
     private long calFailedAtMs = 0;
     private boolean calManual = true;
     private long calStartedMs = 0, calExpectedMs = 0;
@@ -1714,17 +1715,21 @@ public final class MainActivity extends Activity {
 
     // --------------------------------------------------------------- actions
 
-    private void uploadAll() {
-        if (!connected) { showToast("Connect to the robot first"); return; }
-        blurInputs();
-        byte[] values = new byte[]{
+    /** PID, speed and rule switches exactly as shown on screen. */
+    private byte[] settingsBytes() {
+        return new byte[]{
                 1, (byte)kp.value(), 2, (byte)kp.divisor(),
                 3, (byte)ki.value(), 4, (byte)ki.divisor(),
                 5, (byte)kd.value(), 6, (byte)kd.divisor(),
                 13, (byte)speed.base(), 14, (byte)speed.max(),
                 17, (byte)ruleFlags(), 18, (byte)pivotSpeedStep.get()};
+    }
+
+    private void uploadAll() {
+        if (!connected) { showToast("Connect to the robot first"); return; }
+        blurInputs();
         kp.saveLocal(); ki.saveLocal(); kd.saveLocal(); speed.saveLocal(); saveRuleOptions();
-        sendBytes(values, true);
+        sendBytes(settingsBytes(), true);
         sendAllParams();
         addEvent("Sent PID, speed and rule settings. The robot saves them after 2 s.");
         showToast("Sent to robot");
@@ -1748,6 +1753,10 @@ public final class MainActivity extends Activity {
             return;
         }
         blurInputs();
+        // Send what is on screen first, so the robot never starts with old values
+        // (e.g. PID changed while Live tuning was off).
+        kp.saveLocal(); ki.saveLocal(); kd.saveLocal(); speed.saveLocal();
+        sendBytes(settingsBytes(), false);
         startPending = true;
         running = false;
         sendBytes(new byte[]{7, 1}, true);
@@ -2203,6 +2212,21 @@ public final class MainActivity extends Activity {
         if (kpd>4 || kid>4 || kdd>4) { addEvent("Invalid PID values in status."); return; }
         int flags = data[6] & 255;
         if ((flags & ~7) != 0) return;
+        if (framed && !resetWarningShown && (data[7] & 255) == 9) {
+            resetWarningShown = true;
+            addEvent("⚠ The robot restarted because its battery voltage dropped (brownout), "
+                    + "usually when the motors start. Charge the battery, or power the ESP32 "
+                    + "separately from the motors / add a large capacitor.");
+            showToast("Robot restarted: battery voltage dropped");
+        }
+        boolean differs = kp.value() != (data[0] & 255) || kp.divisor() != kpd
+                || ki.value() != (data[2] & 255) || ki.divisor() != kid
+                || kd.value() != (data[4] & 255) || kd.divisor() != kdd
+                || (framed && data.length >= 10 && speed != null
+                    && (speed.base() != (data[8] & 255) || speed.max() != (data[9] & 255)));
+        if (differs && queryReceived)
+            addEvent("The robot reported different PID/speed values than the app showed "
+                    + "(it may have restarted). Showing the robot's values now.");
         kp.setData(data[0] & 255,kpd);
         ki.setData(data[2] & 255,kid);
         kd.setData(data[4] & 255,kdd);
@@ -2265,6 +2289,7 @@ public final class MainActivity extends Activity {
         connected = false;
         if (sensorView != null) sensorView.setConnected(false);
         if (calibrating) finishCalibration(false, "Connection lost during calibration. Reconnect and check the result.");
+        resetWarningShown = false;
     }
 
     /** User-initiated disconnect (or app shutdown): no automatic reconnection. */

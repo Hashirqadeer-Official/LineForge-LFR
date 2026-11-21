@@ -59,7 +59,8 @@
              bit2 line inverted), inversions.
     [18,value] Sharp-turn spin speed % (10..100)
     Frame: A5 5A type length seq payload CRC8(poly=07 over type..payload).
-    Type 51: status (14 payload bytes: six PID fields, flags, reserved,
+    Type 51: status (14 payload bytes: six PID fields, flags, reset reason
+             (esp_reset_reason at last boot, 9 = brownout),
              base speed %, max speed %, rule flags, spin speed %,
              route length, turn delay / 10 ms).
     Type 52: eight QTR intensities + position (u16) + flags + signed PWM L/R.
@@ -298,6 +299,7 @@ void BleUart::begin(const char *name) {
 
 Preferences prefs;
 bool prefsReady = false;
+uint8_t bootResetReason = 0;   // why the ESP32 last restarted (reported to the app)
 
 // ---------------- Bluetooth one-byte replies ----------------
 const uint8_t ACK = 0x06;
@@ -811,7 +813,7 @@ void sendStatusFrame() {
   if (telemetryEnabled) {
     uint8_t p[14];
     for (int i = 0; i < 7; ++i) p[i] = frame[i+1];
-    p[7] = 0; // reserved for future protocol versions
+    p[7] = bootResetReason;  // lets the app warn about brownout restarts
     p[8] = (uint8_t)baseSpeed;
     p[9] = (uint8_t)maxSpeed;
     p[10] = ruleFlags;
@@ -990,6 +992,7 @@ void readBluetooth() {
         Serial.println("BT STOP accepted; motor PWM = 0");
         if (pidDirty) savePID();
       } else if (calOk && !calibrating && !calibrationPending) {
+        if (pidDirty) savePID();   // keep new settings even if motors cause a reset
         robotOn = true;
         pidLast = false;
         iTerm = 0.0f;
@@ -1217,6 +1220,10 @@ void setup() {
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
   Serial.begin(115200);
+  bootResetReason = (uint8_t)esp_reset_reason();
+  Serial.printf("Reset reason: %d%s\n", bootResetReason,
+                bootResetReason == ESP_RST_BROWNOUT
+                    ? "  (BROWNOUT: battery voltage dropped, often when motors start)" : "");
   BT.begin(BLE_DEVICE_NAME);
   Serial.printf("BLE advertising as \"%s\" (Nordic UART Service)\n", BLE_DEVICE_NAME);
 
