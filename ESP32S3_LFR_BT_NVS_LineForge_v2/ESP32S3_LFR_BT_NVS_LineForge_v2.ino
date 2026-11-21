@@ -134,7 +134,7 @@ const uint8_t P_IR_TRIGGER = 4;         // 0 = turn when line is lost, 1 = turn 
 const uint8_t P_IR_SPEED = 5;           // % spin speed for the IR turn
 const uint8_t P_IR_TIMEOUT = 6;         // x100 ms: IR turn gives up
 const uint8_t P_IR_END = 7;             // 0 = stop when outer sensor finds line, 1 = center
-const uint8_t P_IR_DEBOUNCE = 8;        // ms an IR reading must be stable
+const uint8_t P_IR_DEBOUNCE = 8;        // ms: ignore a repeat detection sooner than this (0 = record all)
 const uint8_t P_INVERT_MODE = 9;        // 0 = normal line, 1 = auto detect, 2 = always inverted
 const uint8_t P_INVERT_DARK = 10;       // sensors that must be dark to switch (auto)
 const uint8_t P_INVERT_CONFIRM = 11;    // x10 ms the pattern must last before switching
@@ -154,7 +154,7 @@ const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
   {10, 100, 35},   // 5 IR spin speed 35 %
   {1, 50, 15},     // 6 IR timeout (1.5 s)
   {0, 1, 1},       // 7 IR end: center sensors
-  {0, 255, 20},    // 8 IR debounce 20 ms
+  {0, 255, 0},     // 8 IR repeat filter: 0 = record every detection
   {0, 2, 0},       // 9 invert mode: normal
   {5, 8, 6},       // 10 invert: 6 dark sensors
   {2, 50, 10},     // 11 invert confirm 100 ms
@@ -343,9 +343,14 @@ uint8_t pivotSource = SRC_SHARP;         // which rule started the current spin
 
 // ---- Side IR sensors ----
 bool irLeftActive = false, irRightActive = false;   // debounced: sees black
-bool irLeftRaw = false, irRightRaw = false;
 bool irLeftRose = false, irRightRose = false;       // new detection, for rules
-uint32_t irLeftChangeMs = 0, irRightChangeMs = 0;
+// Every detection is caught by a hardware interrupt, so even a very short
+// pulse is recorded while the main loop is busy; updateIR() handles them.
+volatile uint16_t irLeftPending = 0, irRightPending = 0;
+volatile uint32_t irLeftIsrMs = 0, irRightIsrMs = 0;
+portMUX_TYPE irMux = portMUX_INITIALIZER_UNLOCKED;
+void irLeftIsr();    // declared here: Arduino does not auto-declare IRAM_ATTR functions
+void irRightIsr();
 int8_t irEdge = 0;                     // -1 = IR-L saw the line last, +1 = IR-R
 
 // ---- Inverted line (white line on black) ----
@@ -1209,6 +1214,8 @@ void setup() {
   pinMode(IR_LEFT, INPUT);
   pinMode(IR_RIGHT, INPUT);
   defaultParams();
+  attachInterrupt(digitalPinToInterrupt(IR_LEFT), irLeftIsr, IR_BLACK == HIGH ? RISING : FALLING);
+  attachInterrupt(digitalPinToInterrupt(IR_RIGHT), irRightIsr, IR_BLACK == HIGH ? RISING : FALLING);
   if (BLUE_LED_PIN >= 0) { pinMode(BLUE_LED_PIN, OUTPUT); digitalWrite(BLUE_LED_PIN, LOW); }
   if (GREEN_LED_PIN >= 0) { pinMode(GREEN_LED_PIN, OUTPUT); digitalWrite(GREEN_LED_PIN, LOW); }
 
@@ -1522,22 +1529,41 @@ void sendParamsFrame() {
   sendFramed(PKT_PARAMS, &params[1], PARAM_COUNT);
 }
 
-// Reads both side IR sensors with debounce; counts each new detection.
-void updateIR() {
+// IR interrupt handlers: run the instant a sensor starts seeing black.
+void IRAM_ATTR irLeftIsr() {
   const uint32_t now = millis();
-  const uint32_t debounce = params[P_IR_DEBOUNCE];
-  const bool l = digitalRead(IR_LEFT) == IR_BLACK;
-  const bool r = digitalRead(IR_RIGHT) == IR_BLACK;
-  if (l != irLeftRaw) { irLeftRaw = l; irLeftChangeMs = now; }
-  if (r != irRightRaw) { irRightRaw = r; irRightChangeMs = now; }
-  if (l != irLeftActive && now - irLeftChangeMs >= debounce) {
-    irLeftActive = l;
-    if (l) { irLeftRose = true; robotEvent(EV_IR_LEFT); }
+  const uint8_t filter = params[P_IR_DEBOUNCE];
+  portENTER_CRITICAL_ISR(&irMux);
+  if (filter == 0 || now - irLeftIsrMs >= filter) {
+    if (irLeftPending < 65535) irLeftPending = irLeftPending + 1;
+    irLeftIsrMs = now;
   }
-  if (r != irRightActive && now - irRightChangeMs >= debounce) {
-    irRightActive = r;
-    if (r) { irRightRose = true; robotEvent(EV_IR_RIGHT); }
+  portEXIT_CRITICAL_ISR(&irMux);
+}
+
+void IRAM_ATTR irRightIsr() {
+  const uint32_t now = millis();
+  const uint8_t filter = params[P_IR_DEBOUNCE];
+  portENTER_CRITICAL_ISR(&irMux);
+  if (filter == 0 || now - irRightIsrMs >= filter) {
+    if (irRightPending < 65535) irRightPending = irRightPending + 1;
+    irRightIsrMs = now;
   }
+  portEXIT_CRITICAL_ISR(&irMux);
+}
+
+// Counts every detection recorded by the interrupts (none are lost, however
+// short) and refreshes the live "sees black" state.
+void updateIR() {
+  irLeftActive = digitalRead(IR_LEFT) == IR_BLACK;
+  irRightActive = digitalRead(IR_RIGHT) == IR_BLACK;
+  portENTER_CRITICAL(&irMux);
+  uint16_t l = irLeftPending, r = irRightPending;
+  irLeftPending = 0;
+  irRightPending = 0;
+  portEXIT_CRITICAL(&irMux);
+  while (l > 0) { irLeftRose = true; robotEvent(EV_IR_LEFT); l--; }
+  while (r > 0) { irRightRose = true; robotEvent(EV_IR_RIGHT); r--; }
 }
 
 // Inverted line: in "auto" mode, when most sensors are dark but at least one
@@ -1661,6 +1687,8 @@ bool edgeTurnRules(const int *cal, int32_t weighted, int32_t total) {
   }
   // IR memory: which side IR saw the line last (kept until it clears again).
   if (irOn) {
+    if (leftRose && !rightRose) irEdge = -1;        // even a very short detection
+    else if (rightRose && !leftRose) irEdge = 1;
     if (irLeftActive && !irRightActive) irEdge = -1;
     else if (irRightActive && !irLeftActive) irEdge = 1;
     else if (centered && !irLeftActive && !irRightActive) irEdge = 0;

@@ -85,7 +85,7 @@ public final class MainActivity extends Activity {
             P_BOX_DETECT = 13, P_ARM = 14, P_TURN_TIMEOUT = 15, P_JUNCTION_GAP = 16, PARAM_COUNT = 16;
     /** App unit (%, ms) = firmware value x scale. */
     private static final int[] PARAM_SCALE = {1, 10, 100, 1, 1, 1, 100, 1, 1, 1, 1, 10, 10, 10, 10, 100, 10};
-    private static final int[] PARAM_DEFAULT = {0, 50, 15, 0, 0, 35, 15, 1, 20, 0, 6, 10, 5, 25, 15, 30, 30};
+    private static final int[] PARAM_DEFAULT = {0, 50, 15, 0, 0, 35, 15, 1, 0, 0, 6, 10, 5, 25, 15, 30, 30};
     // Route actions shared with the firmware (command 21: action << 4 | seconds).
     private static final int ACT_LEFT = 1, ACT_RIGHT = 2, ACT_STRAIGHT = 3, ACT_UTURN = 4,
             ACT_WAIT_BLUE = 5, ACT_WAIT_GREEN = 6, ACT_FINISH = 7;
@@ -984,8 +984,9 @@ public final class MainActivity extends Activity {
         irAdv.addView(paramStepper(P_IR_TIMEOUT, "Give up after",
                 "Back to normal PID if the line isn't found", 1, 50, "ms", ORANGE).view, full());
         irAdv.addView(gap(12));
-        irAdv.addView(paramStepper(P_IR_DEBOUNCE, "Debounce",
-                "Ignore IR flickers shorter than this", 0, 255, "ms", PURPLE).view, full());
+        irAdv.addView(paramStepper(P_IR_DEBOUNCE, "Repeat filter",
+                "0 = record every detection, even very short ones. Raise only if one line counts twice.",
+                0, 255, "ms", PURPLE).view, full());
         content.addView(ir, full());
         content.addView(gap(12));
 
