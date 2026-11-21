@@ -41,7 +41,7 @@
     STOP [7,0] during calibration cancels it (previous calibration kept).
     [17,flags] Option bits: bit 0 = sharp-turn recovery,
                bit 1 = keep the saved calibration if a new one fails,
-               bit 2 = competition route mode
+               bit 2 = competition route mode, bit 3 = IR turn rule
     [19,0] Use the calibration saved in NVS (reply 0xC2, or NAK if none)
     Competition route (option bit 2 = route mode):
     [20,n] Start uploading a route of n steps (0..32)
@@ -50,6 +50,13 @@
               6 wait + green LED, 7 finish (stop)
     [22,value] Turn delay: drive forward value x 10 ms before turning
     Replies: 0xE1 route finished, 0xE0 route stopped (turn not completed).
+    Settings (every rule's thresholds/timeouts, saved in NVS):
+    [23,id] select setting id (see PARAM table)   [24,value] set it
+    [26,0] send all settings (frame type 54)      [27,0] reset counters
+    Type 54: settings, one byte per setting id 1..PARAM_COUNT.
+    Type 55: counters: IR-L count u16, IR-R count u16, junctions, left turns,
+             right turns, gaps, flags (bit0 IR-L sees black, bit1 IR-R,
+             bit2 line inverted), inversions.
     [18,value] Sharp-turn spin speed % (10..100)
     Frame: A5 5A type length seq payload CRC8(poly=07 over type..payload).
     Type 51: status (14 payload bytes: six PID fields, flags, reserved,
@@ -87,6 +94,7 @@ struct PIDRecord;
 struct SpeedRecord;
 struct RuleRecord;
 struct RouteRecord;
+struct ParamRecord;
 
 // ---------------- User options ----------------
 const bool WAIT_FOR_APP = true;
@@ -116,15 +124,61 @@ const bool REQUIRE_APP_HEARTBEAT = WAIT_FOR_APP;
 const uint32_t HEARTBEAT_TIMEOUT_MS = 2500;
 const int MIN_CAL_RANGE = 300;          // raw 12-bit ADC counts
 // Sharp-turn recovery rule (switched on/off from the app's Rules tab).
-const int EDGE_THRESHOLD = 500;         // calibrated 0..1000: outer sensor sees line
+// ---- Settings table: every rule's settings, changeable from the app ----
+// Stored value is one byte; the comment gives its unit. Saved in NVS.
+const uint8_t P_LINE_THRESHOLD = 1;     // x10 = calibrated level (0..1000) that counts as black
+const uint8_t P_SHARP_TIMEOUT = 2;      // x100 ms: sharp turn gives up
+const uint8_t P_SHARP_END = 3;          // 0 = stop when outer sensor finds line, 1 = center
+const uint8_t P_IR_TRIGGER = 4;         // 0 = turn when line is lost, 1 = turn immediately
+const uint8_t P_IR_SPEED = 5;           // % spin speed for the IR turn
+const uint8_t P_IR_TIMEOUT = 6;         // x100 ms: IR turn gives up
+const uint8_t P_IR_END = 7;             // 0 = stop when outer sensor finds line, 1 = center
+const uint8_t P_IR_DEBOUNCE = 8;        // ms an IR reading must be stable
+const uint8_t P_INVERT_MODE = 9;        // 0 = normal line, 1 = auto detect, 2 = always inverted
+const uint8_t P_INVERT_DARK = 10;       // sensors that must be dark to switch (auto)
+const uint8_t P_INVERT_CONFIRM = 11;    // x10 ms the pattern must last before switching
+const uint8_t P_GAP_MIN = 12;           // x10 ms of lost line that counts as a gap
+const uint8_t P_BOX_DETECT = 13;        // x10 ms whole array dark = inside a box (route)
+const uint8_t P_ARM = 14;               // x10 ms centered line before the next junction (route)
+const uint8_t P_TURN_TIMEOUT = 15;      // x100 ms route turn gives up
+const uint8_t P_JUNCTION_GAP = 16;      // x10 ms minimum time between counted junctions
+const uint8_t PARAM_COUNT = 16;
+struct ParamDef { uint8_t minV, maxV, def; };
+const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
+  {0, 0, 0},       // 0 unused
+  {10, 100, 50},   // 1 line threshold (500)
+  {1, 50, 15},     // 2 sharp timeout (1.5 s)
+  {0, 1, 0},       // 3 sharp end: outer sensor
+  {0, 1, 0},       // 4 IR trigger: when line lost
+  {10, 100, 35},   // 5 IR spin speed 35 %
+  {1, 50, 15},     // 6 IR timeout (1.5 s)
+  {0, 1, 1},       // 7 IR end: center sensors
+  {0, 255, 20},    // 8 IR debounce 20 ms
+  {0, 2, 0},       // 9 invert mode: normal
+  {5, 8, 6},       // 10 invert: 6 dark sensors
+  {2, 50, 10},     // 11 invert confirm 100 ms
+  {1, 100, 5},     // 12 gap minimum 50 ms
+  {5, 100, 25},    // 13 box detect 250 ms
+  {5, 100, 15},    // 14 arm 150 ms
+  {5, 100, 30},    // 15 route turn timeout 3 s
+  {5, 100, 30},    // 16 junction spacing 300 ms
+};
+uint8_t params[PARAM_COUNT + 1];
+uint8_t selectedParam = 0;
+#define EDGE_THRESHOLD ((int)params[P_LINE_THRESHOLD] * 10)
+#define PIVOT_TIMEOUT_MS ((uint32_t)params[P_SHARP_TIMEOUT] * 100U)
+#define ARM_MS ((uint32_t)params[P_ARM] * 10U)
+#define BOX_DETECT_MS ((uint32_t)params[P_BOX_DETECT] * 10U)
+#define TURN_TIMEOUT_MS ((uint32_t)params[P_TURN_TIMEOUT] * 100U)
 const float CENTERED_ERROR = 1.5f;      // line this close to center clears the edge memory
-const uint32_t PIVOT_TIMEOUT_MS = 1500; // give up spinning if the line is not found
 const int DEFAULT_PIVOT_SPEED = 35;     // percent
 
 // ---------------- Pin connections ----------------
 const int AIN1 = 42, AIN2 = 41, PWMA = 21; // left motor
 const int BIN1 = 40, BIN2 = 39, PWMB = 47; // right motor
 const int QTR[8] = {7, 15, 16, 17, 18, 8, 9, 10};
+const int IR_LEFT = 14, IR_RIGHT = 4;   // side IR sensors (IR-L, IR-R), digital modules
+const int IR_BLACK = HIGH;              // module output level when it sees the black line
 const int USER_BOOT_GPIO  = 0;                // hold after startup to recalibrate
 
 // ---------------- BLE Nordic UART transport ----------------
@@ -255,6 +309,8 @@ const uint8_t STATUS_REPLY = 0xD0;
 const uint8_t PKT_STATUS = 0x51;
 const uint8_t PKT_SENSOR = 0x52;
 const uint8_t PKT_CAL = 0x53;
+const uint8_t PKT_PARAMS = 0x54;
+const uint8_t PKT_COUNTERS = 0x55;
 const uint8_t HEARTBEAT_TIMEOUT_REPLY = 0xD1;
 
 // ---------------- Working state ----------------
@@ -279,6 +335,34 @@ int pivotSpeed = DEFAULT_PIVOT_SPEED;   // cmd 18, saved in NVS
 int8_t lastEdge = 0;                    // -1 = S1 (left) saw line last, +1 = S8 (right)
 int8_t pivotDir = 0;                    // 0 = not pivoting, -1 left, +1 right
 uint32_t pivotStartMs = 0;
+const uint8_t RULE_IR_TURN = 0x08;
+const uint8_t SRC_SHARP = 0, SRC_IR = 1;
+uint8_t pivotSource = SRC_SHARP;         // which rule started the current spin
+
+// ---- Side IR sensors ----
+bool irLeftActive = false, irRightActive = false;   // debounced: sees black
+bool irLeftRaw = false, irRightRaw = false;
+bool irLeftRose = false, irRightRose = false;       // new detection, for rules
+uint32_t irLeftChangeMs = 0, irRightChangeMs = 0;
+int8_t irEdge = 0;                     // -1 = IR-L saw the line last, +1 = IR-R
+
+// ---- Inverted line (white line on black) ----
+bool lineInverted = false;
+uint32_t invertPatternSinceMs = 0;
+
+// ---- Counters and event flags (for current and future conditions) ----
+const uint8_t EV_GAP = 1, EV_JUNCTION = 2, EV_LEFT_TURN = 3, EV_RIGHT_TURN = 4,
+              EV_IR_LEFT = 5, EV_IR_RIGHT = 6, EV_INVERTED_ON = 7, EV_INVERTED_OFF = 8;
+struct RunCounters {
+  uint16_t irLeft, irRight;
+  uint8_t junctions, leftTurns, rightTurns, gaps, inversions;
+};
+RunCounters counters = {};
+// Flags: set when the event happens, cleared on START / reset.
+bool flagGap = false, flagJunction = false, flagLeftTurn = false, flagRightTurn = false;
+bool flagIrLeft = false, flagIrRight = false;
+uint32_t lineLostSinceMs = 0, lastJunctionMs = 0;
+bool junctionActive = false;
 
 // ---- Competition route (option bit 2) ----
 const uint8_t RULE_ROUTE = 0x04;
@@ -288,10 +372,7 @@ const uint8_t ACT_LEFT = 1, ACT_RIGHT = 2, ACT_STRAIGHT = 3, ACT_UTURN = 4,
 // Optional external indicator LEDs (-1 = only use the on-board RGB LED).
 const int BLUE_LED_PIN = -1;            // water filled
 const int GREEN_LED_PIN = -1;           // people rescued
-const uint32_t ARM_MS = 150;            // centered line needed before the next junction
-const uint32_t BOX_DETECT_MS = 250;     // whole array dark this long = inside a box
 const uint32_t JUNCTION_TIMEOUT_MS = 1500;
-const uint32_t TURN_TIMEOUT_MS = 3000;  // a turn that never finds the line stops the run
 const uint32_t REVERSE_MS = 250;        // back out of a box before a U-turn
 const uint32_t TURN_LEAVE_MIN_MS = 80;
 const uint32_t UTURN_LEAVE_MIN_MS = 300;
@@ -337,6 +418,7 @@ const uint32_t PID_MAGIC = 0x4C465250;  // 'LFRP'
 const uint32_t SPD_MAGIC = 0x4C465253;  // 'LFRS'
 const uint32_t RUL_MAGIC = 0x4C465252;  // 'LFRR'
 const uint32_t RTE_MAGIC = 0x4C465254;  // 'LFRT'
+const uint32_t PRM_MAGIC = 0x4C465251;  // 'LFRQ'
 const uint16_t STORAGE_VERSION = 1;
 
 struct CalibrationRecord {
@@ -354,6 +436,14 @@ struct PIDRecord {
   uint8_t kpVal, kpDiv;
   uint8_t kiVal, kiDiv;
   uint8_t kdVal, kdDiv;
+  uint32_t checksum;
+};
+
+struct ParamRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint8_t count, reserved;
+  uint8_t values[32];
   uint32_t checksum;
 };
 
@@ -464,6 +554,36 @@ bool saveRules() {
   return prefs.putBytes("rul", &r, sizeof(r)) == sizeof(r);
 }
 
+void defaultParams() {
+  for (int i = 0; i <= PARAM_COUNT; ++i) params[i] = PARAM_DEFS[i].def;
+}
+
+bool loadParams() {
+  defaultParams();
+  if (!prefsReady || prefs.getBytesLength("prm") != sizeof(ParamRecord)) return false;
+  ParamRecord r = {};
+  if (prefs.getBytes("prm", &r, sizeof(r)) != sizeof(r)) return false;
+  if (r.magic != PRM_MAGIC || r.version != STORAGE_VERSION) return false;
+  if (r.checksum != checksum32(&r, offsetof(ParamRecord, checksum))) return false;
+  // Settings added in a newer firmware keep their defaults.
+  for (int i = 1; i <= PARAM_COUNT && i <= r.count; ++i) {
+    uint8_t v = r.values[i];
+    if (v >= PARAM_DEFS[i].minV && v <= PARAM_DEFS[i].maxV) params[i] = v;
+  }
+  return true;
+}
+
+bool saveParams() {
+  if (!prefsReady) return false;
+  ParamRecord r = {};
+  r.magic = PRM_MAGIC;
+  r.version = STORAGE_VERSION;
+  r.count = PARAM_COUNT;
+  for (int i = 0; i <= PARAM_COUNT; ++i) r.values[i] = params[i];
+  r.checksum = checksum32(&r, offsetof(ParamRecord, checksum));
+  return prefs.putBytes("prm", &r, sizeof(r)) == sizeof(r);
+}
+
 bool loadRoute() {
   if (!prefsReady || prefs.getBytesLength("rte") != sizeof(RouteRecord)) return false;
   RouteRecord r = {};
@@ -495,6 +615,7 @@ bool savePID() {
   saveSpeed();
   saveRules();
   saveRoute();
+  saveParams();
 
   PIDRecord r = {};
   r.magic = PID_MAGIC;
@@ -651,6 +772,7 @@ void sendSensorFrameIfDue() {
                 (black[s] - white[s]), (int32_t)0, (int32_t)1000);
     else
       signal = raw * 1000L / 4095L;
+    if (lineInverted && calOk) signal = 1000 - signal;  // show the line, not the floor
     p[s] = (uint8_t)((signal * 255L + 500) / 1000);
     if (calOk && signal > 250) {
       weighted += (long)(signal - 250) * s;
@@ -667,6 +789,7 @@ void sendSensorFrameIfDue() {
   p[14] = (uint8_t)routeLen;
   p[15] = routeState;
   sendFramed(PKT_SENSOR, p, sizeof(p));
+  sendCountersFrame();
 }
 
 // 9-byte legacy status message or CRC-framed status (when telemetry enabled).
@@ -704,7 +827,7 @@ void sendStatusFrame() {
 void readBluetooth() {
   while (BT.available() >= 2) {
     int cmd = BT.peek();
-    if (cmd < 1 || cmd > 22) {
+    if (cmd < 1 || cmd > 27) {
       BT.read();  // skip invalid leading byte
       continue;
     }
@@ -725,10 +848,34 @@ void readBluetooth() {
         (cmd == 19 && val != 0) ||
         (cmd == 20 && val > MAX_ROUTE_STEPS) ||
         (cmd == 21 && ((val >> 4) < ACT_LEFT || (val >> 4) > ACT_FINISH)) ||
-        (cmd == 22 && val > 50)) {
+        (cmd == 22 && val > 50) ||
+        (cmd == 23 && (val < 1 || val > PARAM_COUNT)) ||
+        (cmd == 25) ||
+        (cmd == 26 && val != 0) ||
+        (cmd == 27 && val != 0)) {
       BT.write(NAK);
       continue;
     }
+
+    if (cmd == 23) { selectedParam = (uint8_t)val; BT.write(ACK); continue; }
+    if (cmd == 24) {
+      if (selectedParam < 1 || selectedParam > PARAM_COUNT ||
+          val < PARAM_DEFS[selectedParam].minV || val > PARAM_DEFS[selectedParam].maxV) {
+        BT.write(NAK);
+        continue;
+      }
+      params[selectedParam] = (uint8_t)val;
+      if (selectedParam == P_INVERT_MODE) {
+        lineInverted = (val == 2);
+        invertPatternSinceMs = 0;
+      }
+      pidDirty = true;                 // saved to NVS together with PID
+      lastPIDChangeMs = millis();
+      BT.write(ACK);
+      continue;
+    }
+    if (cmd == 26) { sendParamsFrame(); continue; }
+    if (cmd == 27) { resetCounters(); BT.write(ACK); sendCountersFrame(); continue; }
 
     if (cmd >= 20 && cmd <= 22) {
       if (robotOn) { BT.write(NAK); continue; }  // never change the route mid-run
@@ -851,6 +998,8 @@ void readBluetooth() {
         startPulseAtMs = millis();
         startPulseActive = START_PULSE_MS > 0;
         if (ruleFlags & RULE_ROUTE) routeReset();
+        resetCounters();
+        lineInverted = params[P_INVERT_MODE] == 2;
 
         // Drive both motors immediately, before the first QTR PID sample.
         // Gives low-speed motors an initial kick against static friction.
@@ -1054,6 +1203,9 @@ void setup() {
   pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
   pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
   pinMode(USER_BOOT_GPIO, INPUT_PULLUP);
+  pinMode(IR_LEFT, INPUT);
+  pinMode(IR_RIGHT, INPUT);
+  defaultParams();
   if (BLUE_LED_PIN >= 0) { pinMode(BLUE_LED_PIN, OUTPUT); digitalWrite(BLUE_LED_PIN, LOW); }
   if (GREEN_LED_PIN >= 0) { pinMode(GREEN_LED_PIN, OUTPUT); digitalWrite(GREEN_LED_PIN, LOW); }
 
@@ -1087,6 +1239,8 @@ void setup() {
   if (loadSpeed()) Serial.println("Stored speed loaded from NVS");
   if (loadRules()) Serial.println("Stored rules loaded from NVS");
   if (loadRoute()) Serial.printf("Stored route loaded: %d steps\n", routeLen);
+  if (loadParams()) Serial.println("Stored rule settings loaded from NVS");
+  lineInverted = params[P_INVERT_MODE] == 2;
   Serial.printf("Rules: sharp-turn recovery %s, spin %d%%\n",
                 (ruleFlags & RULE_SHARP_TURN) ? "ON" : "OFF", pivotSpeed);
   Serial.printf("Speed: base %d%%  max %d%%\n", baseSpeed, maxSpeed);
@@ -1158,6 +1312,7 @@ void routeBackToFollow() {
 }
 
 void routeStartTurn(int8_t dir, bool uturn) {
+  if (!uturn) robotEvent(dir < 0 ? EV_LEFT_TURN : EV_RIGHT_TURN);
   turnDir = dir;
   turnIsUTurn = uturn;
   enterRouteState(uturn ? RS_REVERSE : RS_TURN_FWD);
@@ -1313,55 +1468,214 @@ bool routeStep(const int *cal, int32_t total) {
   return false;
 }
 
-// ---------------- Rule: sharp-turn recovery ----------------
-// If the leftmost (S1) or rightmost (S8) sensor saw the line and then the
-// whole array loses it (typical 90-degree turn taken too fast), spin in place
-// toward that side until that same outer sensor finds the line again:
-//   S1 side: right motor forward, left motor backward (turn left)
-//   S8 side: left motor forward, right motor backward (turn right)
-// Then PID resumes. Returns true while pivoting (PID skipped this cycle).
-bool sharpTurnRule(const int *cal, int32_t weighted, int32_t total) {
-  if (!(ruleFlags & RULE_SHARP_TURN)) return false;
-  const bool leftOuter = cal[0] > EDGE_THRESHOLD;
-  const bool rightOuter = cal[7] > EDGE_THRESHOLD;
+// ---------------- Events, counters and flags ----------------
+// Every detected event goes through robotEvent(): it updates the counters
+// (sent to the app 8x per second) and sets a flag. Add future conditions at
+// the bottom of robotEvent(), e.g. "turn at the 3rd IR-L detection".
+void robotEvent(uint8_t ev) {
+  switch (ev) {
+    case EV_GAP:          if (counters.gaps < 255) counters.gaps++; flagGap = true; break;
+    case EV_JUNCTION:     if (counters.junctions < 255) counters.junctions++; flagJunction = true; break;
+    case EV_LEFT_TURN:    if (counters.leftTurns < 255) counters.leftTurns++; flagLeftTurn = true; break;
+    case EV_RIGHT_TURN:   if (counters.rightTurns < 255) counters.rightTurns++; flagRightTurn = true; break;
+    case EV_IR_LEFT:      if (counters.irLeft < 65535) counters.irLeft++; flagIrLeft = true; break;
+    case EV_IR_RIGHT:     if (counters.irRight < 65535) counters.irRight++; flagIrRight = true; break;
+    case EV_INVERTED_ON:
+    case EV_INVERTED_OFF: if (counters.inversions < 255) counters.inversions++; break;
+  }
+  // ---- Future conditions go here, for example: ----
+  // if (ev == EV_GAP && counters.gaps == 2) { /* do something at the 2nd gap */ }
+  // if (ev == EV_IR_LEFT && counters.irLeft == 3) { /* 3rd left IR detection */ }
+}
+
+void resetCounters() {
+  counters = RunCounters();
+  flagGap = flagJunction = flagLeftTurn = flagRightTurn = false;
+  flagIrLeft = flagIrRight = false;
+  lineLostSinceMs = 0;
+  lastJunctionMs = 0;
+  junctionActive = false;
+  irEdge = 0;
+}
+
+void sendCountersFrame() {
+  uint8_t p[10];
+  p[0] = (uint8_t)(counters.irLeft & 255);  p[1] = (uint8_t)(counters.irLeft >> 8);
+  p[2] = (uint8_t)(counters.irRight & 255); p[3] = (uint8_t)(counters.irRight >> 8);
+  p[4] = counters.junctions;
+  p[5] = counters.leftTurns;
+  p[6] = counters.rightTurns;
+  p[7] = counters.gaps;
+  p[8] = (irLeftActive ? 1 : 0) | (irRightActive ? 2 : 0) | (lineInverted ? 4 : 0);
+  p[9] = counters.inversions;
+  sendFramed(PKT_COUNTERS, p, sizeof(p));
+}
+
+void sendParamsFrame() {
+  sendFramed(PKT_PARAMS, &params[1], PARAM_COUNT);
+}
+
+// Reads both side IR sensors with debounce; counts each new detection.
+void updateIR() {
+  const uint32_t now = millis();
+  const uint32_t debounce = params[P_IR_DEBOUNCE];
+  const bool l = digitalRead(IR_LEFT) == IR_BLACK;
+  const bool r = digitalRead(IR_RIGHT) == IR_BLACK;
+  if (l != irLeftRaw) { irLeftRaw = l; irLeftChangeMs = now; }
+  if (r != irRightRaw) { irRightRaw = r; irRightChangeMs = now; }
+  if (l != irLeftActive && now - irLeftChangeMs >= debounce) {
+    irLeftActive = l;
+    if (l) { irLeftRose = true; robotEvent(EV_IR_LEFT); }
+  }
+  if (r != irRightActive && now - irRightChangeMs >= debounce) {
+    irRightActive = r;
+    if (r) { irRightRose = true; robotEvent(EV_IR_RIGHT); }
+  }
+}
+
+// Inverted line: in "auto" mode, when most sensors are dark but at least one
+// sees light (a white line on a black floor) for the confirm time, flip the
+// readings so PID keeps following the line. The same test on the flipped
+// readings switches back. All sensors dark (junction / box) never flips.
+void updateInversion(const int *cal) {
+  const uint8_t mode = params[P_INVERT_MODE];
+  if (mode != 1) {
+    bool want = (mode == 2);
+    if (want != lineInverted) {
+      lineInverted = want;
+      robotEvent(want ? EV_INVERTED_ON : EV_INVERTED_OFF);
+    }
+    return;
+  }
+  int dark = 0, light = 0;
+  for (int s = 0; s < 8; ++s) {
+    if (cal[s] > EDGE_THRESHOLD) dark++;
+    else light++;
+  }
+  const bool pattern = dark >= params[P_INVERT_DARK] && light >= 1;
+  const uint32_t now = millis();
+  if (!pattern) { invertPatternSinceMs = 0; return; }
+  if (invertPatternSinceMs == 0) invertPatternSinceMs = now;
+  if (now - invertPatternSinceMs >= (uint32_t)params[P_INVERT_CONFIRM] * 10U) {
+    lineInverted = !lineInverted;
+    invertPatternSinceMs = 0;
+    Serial.println(lineInverted ? "Inverted line detected: following a white line"
+                                : "Normal line detected: following a black line");
+    robotEvent(lineInverted ? EV_INVERTED_ON : EV_INVERTED_OFF);
+  }
+}
+
+// Counts junctions (both sides dark) and gaps (line lost, then found again
+// without a recovery spin) while driving.
+void updateLineEvents(const int *cal, int32_t total) {
+  const int thr = EDGE_THRESHOLD;
+  int dark = 0;
+  for (int s = 0; s < 8; ++s) if (cal[s] > thr) dark++;
+  const bool bothSides = cal[0] > thr && cal[1] > thr && cal[6] > thr && cal[7] > thr;
+  const bool junction = bothSides || dark >= 7;
+  const uint32_t now = millis();
+  if (junction && !junctionActive &&
+      now - lastJunctionMs >= (uint32_t)params[P_JUNCTION_GAP] * 10U) {
+    robotEvent(EV_JUNCTION);
+    lastJunctionMs = now;
+  }
+  junctionActive = junction;
+
+  if (total == 0) {
+    if (lineLostSinceMs == 0) lineLostSinceMs = now;
+  } else {
+    if (lineLostSinceMs != 0 && pivotDir == 0 && routeState == RS_FOLLOW &&
+        now - lineLostSinceMs >= (uint32_t)params[P_GAP_MIN] * 10U)
+      robotEvent(EV_GAP);
+    lineLostSinceMs = 0;
+  }
+}
+
+void startPivot(int8_t dir, uint8_t source) {
+  pivotDir = dir;
+  pivotSource = source;
+  pivotStartMs = millis();
+  robotEvent(dir < 0 ? EV_LEFT_TURN : EV_RIGHT_TURN);
+  Serial.printf("%s: pivoting %s\n", source == SRC_IR ? "IR turn" : "Sharp turn",
+                dir < 0 ? "left" : "right");
+}
+
+// ---------------- Rules: sharp-turn recovery + IR turn ----------------
+// Sharp turn (QTR): if S1 (leftmost) or S8 (rightmost) saw the line and then
+// the whole array loses it, spin in place toward that side.
+// IR turn: same idea with the side IR sensors; it can also turn immediately
+// when an IR sensor detects the line (setting P_IR_TRIGGER).
+// Spin left = right motor forward, left motor backward (and mirrored).
+// The spin ends when the outer sensor on that side (or the center, per the
+// setting) finds the line, or after the timeout; then PID resumes.
+// Returns true while spinning (PID skipped this cycle).
+bool edgeTurnRules(const int *cal, int32_t weighted, int32_t total) {
+  const bool sharpOn = (ruleFlags & RULE_SHARP_TURN) != 0;
+  const bool irOn = (ruleFlags & RULE_IR_TURN) != 0;
+  const bool leftRose = irLeftRose, rightRose = irRightRose;
+  irLeftRose = irRightRose = false;
+  if (!sharpOn && !irOn) { pivotDir = 0; return false; }
+
+  const int thr = EDGE_THRESHOLD;
+  const bool leftOuter = cal[0] > thr;
+  const bool rightOuter = cal[7] > thr;
+  const bool center = cal[3] > thr || cal[4] > thr;
 
   if (pivotDir != 0) {
-    const bool found = (pivotDir < 0) ? leftOuter : rightOuter;
-    const bool timedOut = (uint32_t)(millis() - pivotStartMs) > PIVOT_TIMEOUT_MS;
+    const bool fromIR = pivotSource == SRC_IR;
+    const bool useCenter = (fromIR ? params[P_IR_END] : params[P_SHARP_END]) != 0;
+    const bool found = useCenter ? center : (pivotDir < 0 ? leftOuter : rightOuter);
+    const uint32_t limit = (uint32_t)(fromIR ? params[P_IR_TIMEOUT] : params[P_SHARP_TIMEOUT]) * 100U;
+    const bool timedOut = (uint32_t)(millis() - pivotStartMs) > limit;
     if (found || timedOut) {
-      Serial.println(found ? "Sharp turn: line found, PID resumes"
-                           : "Sharp turn: timeout, PID search resumes");
+      Serial.println(found ? "Turn finished: line found, PID resumes"
+                           : "Turn timeout: PID search resumes");
       pivotDir = 0;
       lastEdge = 0;
+      irEdge = 0;
       pidLast = false;   // no derivative kick when PID restarts
       iTerm = 0.0f;
       return false;
     }
-    const int pwm = pivotSpeed * 255 / 100;
+    const int speedPct = fromIR ? params[P_IR_SPEED] : pivotSpeed;
+    const int pwm = speedPct * 255 / 100;
     setMotors(pivotDir < 0 ? -pwm : pwm, pivotDir < 0 ? pwm : -pwm);
     return true;
   }
 
-  // Remember which outer sensor saw the line last (ignore crossings where both do).
-  if (leftOuter && !rightOuter) lastEdge = -1;
-  else if (rightOuter && !leftOuter) lastEdge = 1;
-  else if (total > 0 && !leftOuter && !rightOuter &&
-           fabsf((float)weighted / (float)total - 3.5f) < CENTERED_ERROR)
-    lastEdge = 0;      // back on the line normally: forget the edge
+  const bool centered = total > 0 && !leftOuter && !rightOuter &&
+                        fabsf((float)weighted / (float)total - 3.5f) < CENTERED_ERROR;
 
-  if (total == 0 && lastEdge != 0) {
-    pivotDir = lastEdge;
-    pivotStartMs = millis();
-    Serial.printf("Sharp turn: line lost after %s sensor, pivoting %s\n",
-                  pivotDir < 0 ? "S1" : "S8", pivotDir < 0 ? "left" : "right");
-    const int pwm = pivotSpeed * 255 / 100;
-    setMotors(pivotDir < 0 ? -pwm : pwm, pivotDir < 0 ? pwm : -pwm);
-    return true;
+  // Sharp turn memory: which outer QTR sensor saw the line last.
+  if (sharpOn) {
+    if (leftOuter && !rightOuter) lastEdge = -1;
+    else if (rightOuter && !leftOuter) lastEdge = 1;
+    else if (centered) lastEdge = 0;
   }
-  return false;
+  // IR memory: which side IR saw the line last (kept until it clears again).
+  if (irOn) {
+    if (irLeftActive && !irRightActive) irEdge = -1;
+    else if (irRightActive && !irLeftActive) irEdge = 1;
+    else if (centered && !irLeftActive && !irRightActive) irEdge = 0;
+  }
+
+  if (irOn && params[P_IR_TRIGGER] == 1 && (leftRose != rightRose)) {
+    startPivot(leftRose ? -1 : 1, SRC_IR);       // turn immediately on detection
+  } else if (total == 0 && sharpOn && lastEdge != 0) {
+    startPivot(lastEdge, SRC_SHARP);
+  } else if (total == 0 && irOn && irEdge != 0) {
+    startPivot(irEdge, SRC_IR);
+  } else {
+    return false;
+  }
+  const int speedPct = pivotSource == SRC_IR ? params[P_IR_SPEED] : pivotSpeed;
+  const int pwm = speedPct * 255 / 100;
+  setMotors(pivotDir < 0 ? -pwm : pwm, pivotDir < 0 ? pwm : -pwm);
+  return true;
 }
 
 void loop() {
+  updateIR();
   if (BT.takeLinkDropped()) {
     telemetryEnabled = false;
     if (REQUIRE_APP_HEARTBEAT && robotOn) {
@@ -1424,16 +1738,20 @@ void loop() {
     int32_t span = black[s] - white[s]; // >= MIN_CAL_RANGE if calOk
     calibrated[s] = constrain((int32_t)(raw - white[s]) * 1000 / span,
                               (int32_t)0, (int32_t)1000);
+    if (lineInverted) calibrated[s] = 1000 - calibrated[s];  // white line on black
     if (calibrated[s] > 250) {
       weighted += (int32_t)(calibrated[s] - 250) * s;
       total += calibrated[s] - 250;
     }
   }
 
+  updateInversion(calibrated);
+  updateLineEvents(calibrated, total);
+
   if (ruleFlags & RULE_ROUTE) {
     if (routeStep(calibrated, total)) return;   // route engine drives this cycle
     if (!robotOn) return;                       // route finished or stopped
-  } else if (sharpTurnRule(calibrated, weighted, total)) {
+  } else if (edgeTurnRules(calibrated, weighted, total)) {
     return;                                     // pivoting this cycle
   }
 

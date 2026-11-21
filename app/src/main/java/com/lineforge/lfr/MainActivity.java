@@ -32,14 +32,12 @@ import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
-import android.widget.CompoundButton;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
-import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -78,7 +76,16 @@ public final class MainActivity extends Activity {
     private static final int[] TAB_ICONS = {TabIcon.DRIVE, TabIcon.TUNE, TabIcon.CALIBRATE, TabIcon.RULES, TabIcon.LOG};
     private static final int TAB_CALIBRATE = 2, TAB_LOG = 4;
     // Option bits shared with the firmware (command 17).
-    private static final int RULE_SHARP_TURN = 0x01, RULE_KEEP_OLD_CAL = 0x02, RULE_ROUTE = 0x04;
+    private static final int RULE_SHARP_TURN = 0x01, RULE_KEEP_OLD_CAL = 0x02, RULE_ROUTE = 0x04,
+            RULE_IR_TURN = 0x08;
+    // Rule settings shared with the firmware (commands 23/24, frame type 0x54).
+    private static final int P_LINE_THRESHOLD = 1, P_SHARP_TIMEOUT = 2, P_SHARP_END = 3,
+            P_IR_TRIGGER = 4, P_IR_SPEED = 5, P_IR_TIMEOUT = 6, P_IR_END = 7, P_IR_DEBOUNCE = 8,
+            P_INVERT_MODE = 9, P_INVERT_DARK = 10, P_INVERT_CONFIRM = 11, P_GAP_MIN = 12,
+            P_BOX_DETECT = 13, P_ARM = 14, P_TURN_TIMEOUT = 15, P_JUNCTION_GAP = 16, PARAM_COUNT = 16;
+    /** App unit (%, ms) = firmware value x scale. */
+    private static final int[] PARAM_SCALE = {1, 10, 100, 1, 1, 1, 100, 1, 1, 1, 1, 10, 10, 10, 10, 100, 10};
+    private static final int[] PARAM_DEFAULT = {0, 50, 15, 0, 0, 35, 15, 1, 20, 0, 6, 10, 5, 25, 15, 30, 30};
     // Route actions shared with the firmware (command 21: action << 4 | seconds).
     private static final int ACT_LEFT = 1, ACT_RIGHT = 2, ACT_STRAIGHT = 3, ACT_UTURN = 4,
             ACT_WAIT_BLUE = 5, ACT_WAIT_GREEN = 6, ACT_FINISH = 7;
@@ -107,7 +114,7 @@ public final class MainActivity extends Activity {
     private TextView connectionLabel, selectedDevice, heroStatus, eventLog, sendCountLabel;
     private View connectionDot;
     private Button connectButton, startButton, stopButton;
-    private Switch liveSwitch;
+    private Toggle liveSwitch;
     private PidControl kp, ki, kd;
     private SpeedControl speed;
     private int sentBytes = 0, receivedBytes = 0;
@@ -131,12 +138,17 @@ public final class MainActivity extends Activity {
     private Button calStartButton;
     private boolean calibrating = false;
     // Rules + saved-calibration options
-    private Switch sharpTurnSwitch, keepOldCalSwitch;
+    private Toggle sharpTurnSwitch, keepOldCalSwitch, irTurnSwitch;
+    private final Stepper[] paramSteppers = new Stepper[PARAM_COUNT + 1];
+    private final Segmented[] paramSegs = new Segmented[PARAM_COUNT + 1];
+    private LinearLayout invertOptions;
+    private final TextView[] counterViews = new TextView[6];
+    private TextView lineModeLabel, irLiveLabel;
     private Stepper pivotSpeedStep;
     private boolean bindingRules = false;
     private boolean restorePending = false;
     // Competition route
-    private Switch routeSwitch;
+    private Toggle routeSwitch;
     private Segmented pathSeg;
     private Stepper waitReservoirStep, waitBuildingStep, turnDelayStep;
     private LinearLayout routeListView;
@@ -461,6 +473,9 @@ public final class MainActivity extends Activity {
         content.addView(sensorCard, full());
         content.addView(gap(12));
 
+        content.addView(buildCountersCard(), full());
+        content.addView(gap(12));
+
         speed = new SpeedControl();
         content.addView(speed.view, full());
         return content;
@@ -496,16 +511,12 @@ public final class MainActivity extends Activity {
         liveText.addView(txt("Live tuning", 14, TEXT, true));
         liveText.addView(txt("Send changes to the robot instantly", 11, MUTED, false));
         live.addView(liveText, weighted());
-        liveSwitch = new Switch(this);
-        liveSwitch.setThumbTintList(ColorStateList.valueOf(MINT));
-        liveSwitch.setTrackTintList(ColorStateList.valueOf(BORDER));
-        liveSwitch.setChecked(preferences.getBoolean("live", false));
-        liveTune = liveSwitch.isChecked();
-        liveSwitch.setOnCheckedChangeListener((CompoundButton b, boolean checked) -> {
-            liveTune = checked;
-            preferences.edit().putBoolean("live", checked).apply();
+        liveTune = preferences.getBoolean("live", false);
+        liveSwitch = new Toggle(liveTune, on -> {
+            liveTune = on;
+            preferences.edit().putBoolean("live", on).apply();
         });
-        live.addView(liveSwitch);
+        live.addView(liveSwitch.view);
         intro.addView(live, full());
         content.addView(intro, full());
         content.addView(gap(12));
@@ -722,25 +733,177 @@ public final class MainActivity extends Activity {
 
     // ------------------------------------------------------------- Rules page
 
-    /** Adds a title/subtitle row with a switch to parent; changes are sent to the robot. */
-    private Switch optionSwitch(String title, String subtitle, boolean checked, LinearLayout parent) {
+    private interface BoolListener { void on(boolean value); }
+
+    /** Clear two-state control: [ OFF | ON ], the active side is filled (red / green). */
+    private final class Toggle {
+        final LinearLayout view = row();
+        private final TextView off, on;
+        private final BoolListener listener;
+        private boolean checked;
+
+        Toggle(boolean initial, BoolListener listener) {
+            this.listener = listener;
+            view.setBackground(rounded(BG, 12, BORDER));
+            view.setPadding(dp(3), dp(3), dp(3), dp(3));
+            off = txt("OFF", 12, MUTED, true);
+            on = txt("ON", 12, MUTED, true);
+            off.setGravity(Gravity.CENTER);
+            on.setGravity(Gravity.CENTER);
+            off.setOnClickListener(v -> userSet(false));
+            on.setOnClickListener(v -> userSet(true));
+            view.addView(off, new LinearLayout.LayoutParams(dp(50), dp(34)));
+            view.addView(on, new LinearLayout.LayoutParams(dp(50), dp(34)));
+            setChecked(initial);
+        }
+
+        private void userSet(boolean value) {
+            if (value == checked) return;
+            setChecked(value);
+            if (listener != null) listener.on(value);
+        }
+
+        /** Programmatic update: the listener is not called. */
+        void setChecked(boolean value) {
+            checked = value;
+            on.setBackground(value ? rounded(GREEN, 10, 0) : null);
+            on.setTextColor(value ? BG : MUTED);
+            off.setBackground(value ? null : rounded(tint(RED, 70), 10, RED));
+            off.setTextColor(value ? MUTED : TEXT);
+        }
+
+        boolean isChecked() { return checked; }
+    }
+
+    /** Title/subtitle row with an ON/OFF toggle; changes are saved and sent to the robot. */
+    private Toggle optionSwitch(String title, String subtitle, boolean checked, LinearLayout parent) {
         LinearLayout r = row();
         LinearLayout names = col();
-        names.addView(txt(title, 14, TEXT, true));
+        names.addView(txt(title, 15, TEXT, true));
         names.addView(txt(subtitle, 11, MUTED, false));
         r.addView(names, weighted());
-        Switch sw = new Switch(this);
-        sw.setThumbTintList(ColorStateList.valueOf(MINT));
-        sw.setTrackTintList(ColorStateList.valueOf(BORDER));
-        sw.setChecked(checked);
-        sw.setOnCheckedChangeListener((b, on) -> {
+        Toggle t = new Toggle(checked, value -> {
             if (bindingRules) return;
             saveRuleOptions();
             sendRuleOptions(true);
         });
-        r.addView(sw);
+        r.addView(t.view);
         parent.addView(r, full());
-        return sw;
+        return t;
+    }
+
+    /** Tappable "▸ title" header that shows/hides the returned section. */
+    private LinearLayout collapsible(LinearLayout parent, String title) {
+        TextView head = txt("▸  " + title, 13, MINT, true);
+        head.setPadding(0, dp(8), 0, dp(8));
+        LinearLayout body = col();
+        body.setVisibility(View.GONE);
+        head.setOnClickListener(v -> {
+            boolean show = body.getVisibility() != View.VISIBLE;
+            body.setVisibility(show ? View.VISIBLE : View.GONE);
+            head.setText((show ? "▾  " : "▸  ") + title);
+        });
+        parent.addView(head, full());
+        parent.addView(body, full());
+        return body;
+    }
+
+    private TextView label(String s) {
+        TextView t = txt(s, 13, TEXT, true);
+        t.setPadding(0, dp(14), 0, dp(6));
+        return t;
+    }
+
+    // ------------------------------------------------------- rule settings
+
+    private int paramValue(int id) { return preferences.getInt("p" + id, PARAM_DEFAULT[id]); }
+
+    /** Number setting; minFw/maxFw are firmware units, shown as firmware x scale. */
+    private Stepper paramStepper(int id, String title, String hint, int minFw, int maxFw, String unit, int color) {
+        final int scale = PARAM_SCALE[id];
+        Stepper st = new Stepper(title, hint, minFw * scale, maxFw * scale, paramValue(id) * scale, unit, color, false);
+        st.stepSize = scale;
+        st.onCommit = v -> setParam(id, Math.round(v / (float)scale));
+        paramSteppers[id] = st;
+        return st;
+    }
+
+    private Segmented paramSeg(int id, String[] labels) {
+        Segmented sg = new Segmented(labels, paramValue(id), i -> setParam(id, i));
+        paramSegs[id] = sg;
+        return sg;
+    }
+
+    private void setParam(int id, int fwValue) {
+        preferences.edit().putInt("p" + id, fwValue).apply();
+        if (paramSteppers[id] != null) paramSteppers[id].set(fwValue * PARAM_SCALE[id]);
+        if (connected) sendBytes(new byte[]{23, (byte)id, 24, (byte)fwValue}, false);
+        if (id == P_INVERT_MODE) updateInvertUi();
+    }
+
+    private void sendAllParams() {
+        if (!connected) return;
+        byte[] b = new byte[PARAM_COUNT * 4];
+        for (int id = 1; id <= PARAM_COUNT; id++) {
+            int k = (id - 1) * 4;
+            b[k] = 23; b[k + 1] = (byte)id; b[k + 2] = 24; b[k + 3] = (byte)paramValue(id);
+        }
+        sendBytes(b, false);
+    }
+
+    /** The robot's saved settings are the source of truth once it reports them. */
+    private void applyParamsFromRobot(byte[] payload) {
+        SharedPreferences.Editor e = preferences.edit();
+        for (int i = 0; i < payload.length && i < PARAM_COUNT; i++) {
+            int id = i + 1, v = payload[i] & 255;
+            e.putInt("p" + id, v);
+            if (paramSteppers[id] != null) paramSteppers[id].set(v * PARAM_SCALE[id]);
+            if (paramSegs[id] != null) paramSegs[id].select(v, false);
+        }
+        e.apply();
+        updateInvertUi();
+    }
+
+    private void updateInvertUi() {
+        if (invertOptions != null) invertOptions.setVisibility(paramValue(P_INVERT_MODE) == 1 ? View.VISIBLE : View.GONE);
+    }
+
+    // --------------------------------------------------------------- counters
+
+    private LinearLayout buildCountersCard() {
+        LinearLayout c = card();
+        LinearLayout head = row();
+        head.addView(txt("Counters", 15, TEXT, true), weighted());
+        TextView reset = txt("Reset", 13, MINT, true);
+        reset.setPadding(dp(10), dp(4), 0, dp(4));
+        reset.setOnClickListener(v -> {
+            if (!connected) { showToast("Connect to the robot first"); return; }
+            sendBytes(new byte[]{27, 0}, true);
+            addEvent("Counters reset.");
+        });
+        head.addView(reset);
+        c.addView(head, full());
+        c.addView(help("Counted since START. Future rules can act on these numbers."));
+        c.addView(gap(10));
+        String[] names = {"IR left", "IR right", "Junctions", "Left turns", "Right turns", "Gaps"};
+        for (int r = 0; r < 2; r++) {
+            LinearLayout line = row();
+            for (int k = 0; k < 3; k++) {
+                if (k > 0) line.addView(hgap(8));
+                counterViews[r * 3 + k] = addTile(line, names[r * 3 + k], null);
+                counterViews[r * 3 + k].setText("0");
+            }
+            c.addView(line, full());
+            if (r == 0) c.addView(gap(8));
+        }
+        c.addView(gap(10));
+        lineModeLabel = help("Line: waiting for robot…");
+        c.addView(lineModeLabel, full());
+        LinearLayout adv = collapsible(c, "Counting settings");
+        adv.addView(paramStepper(P_GAP_MIN, "Gap", "Line lost at least this long counts as a gap", 1, 100, "ms", BLUE).view, full());
+        adv.addView(gap(12));
+        adv.addView(paramStepper(P_JUNCTION_GAP, "Junction spacing", "Ignore a second junction sooner than this", 5, 100, "ms", BLUE).view, full());
+        return c;
     }
 
     private LinearLayout buildRulesPage() {
@@ -748,27 +911,83 @@ public final class MainActivity extends Activity {
         LinearLayout intro = card();
         intro.addView(cardHeader("Driving rules", "saved on the robot"));
         intro.addView(gap(6));
-        intro.addView(help("Extra behaviours on top of PID. Turn a rule on, run a test lap and compare. "
-                + "Changes are sent to the robot right away and kept after power-off."));
+        intro.addView(help("Tap ON or OFF to switch a rule; its settings are right below it. "
+                + "Changes are sent to the robot immediately and kept after power-off."));
         content.addView(intro, full());
         content.addView(gap(12));
-
-        LinearLayout sharp = card();
         int flags = preferences.getInt("rule_flags", RULE_KEEP_OLD_CAL);
-        sharpTurnSwitch = optionSwitch("Sharp turn recovery", "For 90° turns taken at high speed",
+
+        // Line sensors: threshold + inverted line (white line on black)
+        LinearLayout line = card();
+        line.addView(cardHeader("Line sensors", "used by every rule"));
+        line.addView(gap(12));
+        line.addView(paramStepper(P_LINE_THRESHOLD, "Black threshold",
+                "How dark a sensor must read to count as the line", 10, 100, "%", MINT).view, full());
+        line.addView(label("Line color"));
+        line.addView(paramSeg(P_INVERT_MODE, new String[]{"Black line", "Auto", "White line"}).view, full());
+        line.addView(gap(6));
+        line.addView(help("Auto switches by itself when part of the track is a white line on a black floor "
+                + "(most sensors dark, the line light), and back again afterwards."));
+        invertOptions = col();
+        invertOptions.addView(gap(12));
+        invertOptions.addView(paramStepper(P_INVERT_DARK, "Dark sensors to switch",
+                "How many of the 8 sensors must be dark", 5, 8, "", PURPLE).view, full());
+        invertOptions.addView(gap(12));
+        invertOptions.addView(paramStepper(P_INVERT_CONFIRM, "Confirm time",
+                "The pattern must last this long (a junction is shorter)", 2, 50, "ms", PURPLE).view, full());
+        line.addView(invertOptions, full());
+        updateInvertUi();
+        content.addView(line, full());
+        content.addView(gap(12));
+
+        // Sharp turn recovery (QTR outer sensors)
+        LinearLayout sharp = card();
+        sharpTurnSwitch = optionSwitch("Sharp turn recovery", "QTR outer sensors • 90° turns at speed",
                 (flags & RULE_SHARP_TURN) != 0, sharp);
-        sharp.addView(gap(10));
-        sharp.addView(help("If the leftmost sensor (S1) sees the line and then the robot loses it, the robot "
-                + "spins left in place (right motor forward, left motor backward) until S1 finds the line "
-                + "again, then PID takes over. Same to the right with S8. "
-                + "If the line is not found within 1.5 s it goes back to normal PID search."));
-        sharp.addView(gap(14));
+        sharp.addView(gap(8));
+        sharp.addView(help("S1 (leftmost) sees the line, then the robot loses it → spin left in place "
+                + "(right motor forward, left backward) until the line is found, then PID continues. S8 mirrors it."));
+        sharp.addView(gap(12));
         pivotSpeedStep = new Stepper("Spin speed", "Motor power while turning in place", 10, 100,
                 preferences.getInt("pivot_speed", 35), "%", MINT, true);
         pivotSpeedStep.onCommit = v -> { saveRuleOptions(); sendRuleOptions(true); };
         sharp.addView(pivotSpeedStep.view, full());
+        LinearLayout sharpAdv = collapsible(sharp, "More settings");
+        sharpAdv.addView(label("Stop spinning when"));
+        sharpAdv.addView(paramSeg(P_SHARP_END, new String[]{"Outer sensor sees line", "Center sees line"}).view, full());
+        sharpAdv.addView(gap(12));
+        sharpAdv.addView(paramStepper(P_SHARP_TIMEOUT, "Give up after",
+                "Back to normal PID if the line isn't found", 1, 50, "ms", ORANGE).view, full());
         content.addView(sharp, full());
         content.addView(gap(12));
+
+        // IR side sensors
+        LinearLayout ir = card();
+        irTurnSwitch = optionSwitch("IR turn rule", "Left / right IR sensors (GPIO 14 / 4)",
+                (flags & RULE_IR_TURN) != 0, ir);
+        ir.addView(gap(8));
+        irLiveLabel = txt("IR-L  ○      IR-R  ○", 13, MUTED, true);
+        ir.addView(irLiveLabel, full());
+        ir.addView(gap(6));
+        ir.addView(help("IR-L sees the line → spin left (right motor forward, left backward) until the line is "
+                + "found, then PID continues. IR-R mirrors it. Detections are always counted on the Drive tab."));
+        ir.addView(label("Start turning"));
+        ir.addView(paramSeg(P_IR_TRIGGER, new String[]{"When line is lost", "Immediately"}).view, full());
+        ir.addView(gap(12));
+        ir.addView(paramStepper(P_IR_SPEED, "Spin speed", "Motor power while turning in place",
+                10, 100, "%", MINT).view, full());
+        LinearLayout irAdv = collapsible(ir, "More settings");
+        irAdv.addView(label("Stop spinning when"));
+        irAdv.addView(paramSeg(P_IR_END, new String[]{"Outer sensor sees line", "Center sees line"}).view, full());
+        irAdv.addView(gap(12));
+        irAdv.addView(paramStepper(P_IR_TIMEOUT, "Give up after",
+                "Back to normal PID if the line isn't found", 1, 50, "ms", ORANGE).view, full());
+        irAdv.addView(gap(12));
+        irAdv.addView(paramStepper(P_IR_DEBOUNCE, "Debounce",
+                "Ignore IR flickers shorter than this", 0, 255, "ms", PURPLE).view, full());
+        content.addView(ir, full());
+        content.addView(gap(12));
+
         content.addView(buildRouteCard(flags), full());
         return content;
     }
@@ -841,6 +1060,16 @@ public final class MainActivity extends Activity {
         c.addView(edit, full());
         c.addView(gap(16));
 
+        LinearLayout routeAdv = collapsible(c, "Advanced route settings");
+        routeAdv.addView(paramStepper(P_BOX_DETECT, "Box detection",
+                "Whole sensor array dark this long = inside a box", 5, 100, "ms", BLUE).view, full());
+        routeAdv.addView(gap(12));
+        routeAdv.addView(paramStepper(P_ARM, "Settle time",
+                "Straight, centered line needed before the next junction", 5, 100, "ms", BLUE).view, full());
+        routeAdv.addView(gap(12));
+        routeAdv.addView(paramStepper(P_TURN_TIMEOUT, "Turn gives up after",
+                "Stop the run if a turn never finds the line", 5, 100, "ms", ORANGE).view, full());
+        c.addView(gap(10));
         turnDelayStep = new Stepper("Turn delay", "Drive forward before turning, so the wheels reach the junction",
                 0, 500, preferences.getInt("turn_delay", 100), "ms", PURPLE, false);
         turnDelayStep.onCommit = v -> preferences.edit().putInt("turn_delay", v).apply();
@@ -1067,6 +1296,7 @@ public final class MainActivity extends Activity {
         if (sharpTurnSwitch != null && sharpTurnSwitch.isChecked()) f |= RULE_SHARP_TURN;
         if (keepOldCalSwitch != null && keepOldCalSwitch.isChecked()) f |= RULE_KEEP_OLD_CAL;
         if (routeSwitch != null && routeSwitch.isChecked()) f |= RULE_ROUTE;
+        if (irTurnSwitch != null && irTurnSwitch.isChecked()) f |= RULE_IR_TURN;
         return f;
     }
 
@@ -1080,7 +1310,8 @@ public final class MainActivity extends Activity {
         sendBytes(new byte[]{17, (byte)ruleFlags(), 18, (byte)pivotSpeedStep.get()}, true);
         if (log) addEvent("Rules sent: sharp turn " + (sharpTurnSwitch.isChecked() ? "ON" : "OFF")
                 + " (spin " + pivotSpeedStep.get() + "%), keep previous calibration "
-                + (keepOldCalSwitch.isChecked() ? "ON" : "OFF") + ", route mode "
+                + (keepOldCalSwitch.isChecked() ? "ON" : "OFF") + ", IR turn "
+                + (irTurnSwitch != null && irTurnSwitch.isChecked() ? "ON" : "OFF") + ", route mode "
                 + (routeSwitch != null && routeSwitch.isChecked() ? "ON" : "OFF") + ".");
     }
 
@@ -1090,6 +1321,7 @@ public final class MainActivity extends Activity {
         sharpTurnSwitch.setChecked((flags & RULE_SHARP_TURN) != 0);
         keepOldCalSwitch.setChecked((flags & RULE_KEEP_OLD_CAL) != 0);
         if (routeSwitch != null) routeSwitch.setChecked((flags & RULE_ROUTE) != 0);
+        if (irTurnSwitch != null) irTurnSwitch.setChecked((flags & RULE_IR_TURN) != 0);
         bindingRules = false;
         if (pivot >= 10 && pivot <= 100) pivotSpeedStep.set(pivot);
         saveRuleOptions();
@@ -1192,6 +1424,7 @@ public final class MainActivity extends Activity {
         IntListener onChange;   // every user change (live display / constraints)
         IntListener onCommit;   // the user finished changing the value
         private int value;
+        int stepSize = 1;        // − / + change by this (long-press: x10)
         private boolean binding = false;
         private final Runnable commitTask = () -> { if (onCommit != null) onCommit.on(value); };
 
@@ -1287,8 +1520,8 @@ public final class MainActivity extends Activity {
             TextView b = txt(label, 22, TEXT, true);
             b.setGravity(Gravity.CENTER);
             b.setBackground(rounded(PANEL_ALT, 12, BORDER));
-            b.setOnClickListener(v -> { blurInputs(); userChange(value + step, 450); });
-            b.setOnLongClickListener(v -> { blurInputs(); userChange(value + bigStep, 450); return true; });
+            b.setOnClickListener(v -> { blurInputs(); userChange(value + step * stepSize, 450); });
+            b.setOnLongClickListener(v -> { blurInputs(); userChange(value + bigStep * stepSize, 450); return true; });
             return b;
         }
 
@@ -1492,6 +1725,7 @@ public final class MainActivity extends Activity {
                 17, (byte)ruleFlags(), 18, (byte)pivotSpeedStep.get()};
         kp.saveLocal(); ki.saveLocal(); kd.saveLocal(); speed.saveLocal(); saveRuleOptions();
         sendBytes(values, true);
+        sendAllParams();
         addEvent("Sent PID, speed and rule settings. The robot saves them after 2 s.");
         showToast("Sent to robot");
     }
@@ -1766,6 +2000,7 @@ public final class MainActivity extends Activity {
             sendBytes(new byte[]{11, 1}, true);
             requestRobotState();
             requestCalibrationData(false);
+            sendBytes(new byte[]{26, 0}, false);   // read rule settings
         }
         @Override public void onDisconnected(String name, String reason, boolean willRetry) {
             boolean wasConnected = connected;
@@ -1923,6 +2158,21 @@ public final class MainActivity extends Activity {
                 int done = payload[13] & 255, total = payload[14] & 255;
                 sensorInfo.setText("Route step " + done + " of " + total + "   •   " + sensorInfo.getText());
             }
+        } else if (type == Protocol.PARAMS) {
+            applyParamsFromRobot(payload);
+        } else if (type == Protocol.COUNTERS && payload.length >= 10) {
+            int[] v = {(payload[0] & 255) | ((payload[1] & 255) << 8),
+                    (payload[2] & 255) | ((payload[3] & 255) << 8),
+                    payload[4] & 255, payload[5] & 255, payload[6] & 255, payload[7] & 255};
+            for (int i = 0; i < 6; i++) counterViews[i].setText(String.valueOf(v[i]));
+            int f = payload[8] & 255;
+            boolean inverted = (f & 4) != 0;
+            lineModeLabel.setText(inverted ? "Line: WHITE line on black floor (inverted)"
+                    : "Line: black line on light floor");
+            lineModeLabel.setTextColor(inverted ? ORANGE : MUTED);
+            boolean l = (f & 1) != 0, r = (f & 2) != 0;
+            irLiveLabel.setText("IR-L  " + (l ? "●  sees line" : "○") + "      IR-R  " + (r ? "●  sees line" : "○"));
+            irLiveLabel.setTextColor(l || r ? GREEN : MUTED);
         } else if (type == Protocol.CALIBRATION && payload.length == 32) {
             StringBuilder b = new StringBuilder();
             int minRange = Integer.MAX_VALUE;

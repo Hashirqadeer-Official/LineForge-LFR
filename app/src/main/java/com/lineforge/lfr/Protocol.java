@@ -16,6 +16,8 @@ public final class Protocol {
     public static final int STATUS = 0x51;
     public static final int SENSORS = 0x52;
     public static final int CALIBRATION = 0x53;
+    public static final int PARAMS = 0x54;     // rule settings, one byte per setting
+    public static final int COUNTERS = 0x55;   // IR / junction / turn / gap counters
 
     public interface Listener {
         void onPacket(int type, byte[] payload);
@@ -93,7 +95,8 @@ public final class Protocol {
                     if (count < 5) return;
                     int len = buffered[3] & 255;
                     int type = buffered[2] & 255;
-                    if (len > MAX_PAYLOAD || (type != STATUS && type != SENSORS && type != CALIBRATION)) {
+                    if (len > MAX_PAYLOAD || (type != STATUS && type != SENSORS && type != CALIBRATION &&
+                                                  type != PARAMS && type != COUNTERS)) {
                         discard(1); listener.onDiscarded(1, false); continue;
                     }
                     int size = 6 + len;

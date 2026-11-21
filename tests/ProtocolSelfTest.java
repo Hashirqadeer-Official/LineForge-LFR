@@ -37,6 +37,15 @@ public class ProtocolSelfTest {
     p.feed(legacy,legacy.length);yes(c.types.contains(0xD0),"legacy status rejected");
     p.feed(new byte[]{0x06,0x15,(byte)0xC1},3);yes(c.replies.size()==3,"one-byte replies invalid");
     yes(Protocol.frame(Protocol.SENSORS,1,new byte[13]).length==19,"telemetry frame size");
+    // Rule settings (0x54) and counters (0x55) frames, split like BLE notifications.
+    byte[] params=new byte[16];for(int i=0;i<16;i++)params[i]=(byte)(i+1);
+    byte[] counters={5,0,7,0,3,2,1,4,4,0};
+    byte[] both=new byte[0];
+    for(byte[] f:new byte[][]{Protocol.frame(Protocol.PARAMS,10,params),Protocol.frame(Protocol.COUNTERS,11,counters)}){
+      byte[] n=Arrays.copyOf(both,both.length+f.length);System.arraycopy(f,0,n,both.length,f.length);both=n;}
+    int before=c.types.size();
+    for(int i=0;i<both.length;i+=20){int n=Math.min(20,both.length-i);p.feed(Arrays.copyOfRange(both,i,i+n),n);}
+    yes(c.types.size()==before+2 && c.types.contains(Protocol.PARAMS) && c.types.contains(Protocol.COUNTERS),"settings/counters frames not decoded");
     System.out.println("PASS: garbage recovery, CRC failure, fragmented stream, 19B telemetry, 32B calibration, legacy status, ACKs");
   }
 }
