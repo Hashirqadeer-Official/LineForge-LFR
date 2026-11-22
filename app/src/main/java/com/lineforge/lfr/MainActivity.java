@@ -968,25 +968,16 @@ public final class MainActivity extends Activity {
 
         // Junction detection (always on: used by the counters and the route)
         LinearLayout junc = card();
-        junc.addView(cardHeader("Junction detection", "by the shape the sensors see"));
+        junc.addView(cardHeader("Junction detection", "QTR sensors only"));
         junc.addView(gap(6));
-        junc.addView(help("A junction is accepted only when the line was centered just before, and then "
-                + "suddenly becomes wide from the center to the edge (left, right or both). A curve stays narrow "
-                + "and slides sideways, so it is never a junction. After the wide part the robot looks ahead: "
-                + "line ahead = branch / cross, nothing ahead = corner / T."));
-        junc.addView(gap(12));
-        junc.addView(paramStepper(P_LINE_WIDTH, "Normal line width",
-                "How many of the 8 sensors a straight line darkens (see the live bars)", 1, 5, "sensors", MINT).view, full());
+        junc.addView(help("Uses the QTR sensors only. Right path = S7 + S8 dark while the center (S4/S5) "
+                + "is also dark; left path = S1 + S2 dark with the center. A curve moves the line to the edge "
+                + "and the center goes white, so it is not a junction. After passing it the robot looks ahead: "
+                + "center dark = there is also a straight path. In route mode the next step decides where to go."));
         junc.addView(gap(12));
         junc.addView(paramStepper(P_JUNCTION_CONFIRM, "Confirm readings",
-                "Wide shape must be seen this many readings in a row (1 reading = 5 ms). Raise if noise "
-                + "gives false junctions, lower if fast junctions are missed.", 1, 10, "", BLUE).view, full());
-        junc.addView(label("Side IR must confirm branches"));
-        junc.addView(paramSeg(P_JUNCTION_IR, new String[]{"Off", "On"}).view, full());
-        junc.addView(gap(6));
-        junc.addView(help("On: a branch only counts if the IR on that side also saw the black line. The IR "
-                + "sensors sit outside the QTR array, so a curve never reaches them. Use this if curves are "
-                + "still detected as junctions."));
+                "The pattern must be seen this many readings in a row (1 reading = 5 ms). Raise if noise "
+                + "gives false junctions, lower if junctions are missed.", 1, 10, "", BLUE).view, full());
         content.addView(junc, full());
         content.addView(gap(12));
 

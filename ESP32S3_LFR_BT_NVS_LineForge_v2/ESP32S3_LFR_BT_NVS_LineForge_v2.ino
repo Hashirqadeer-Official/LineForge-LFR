@@ -97,7 +97,6 @@ struct SpeedRecord;
 struct RuleRecord;
 struct RouteRecord;
 struct ParamRecord;
-struct LineShape;
 struct IrFilter;
 
 // ---------------- User options ----------------
@@ -153,8 +152,8 @@ const uint8_t P_LEFT_TRIM = 20;         // % of commanded power for the LEFT mot
 const uint8_t P_RIGHT_TRIM = 21;        // % of commanded power for the RIGHT motor
 const uint8_t P_SENSOR_FLIP = 22;       // 1 = QTR array mounted mirrored (S1 on the robot's right)
 const uint8_t P_MOTOR_SWAP = 23;        // 1 = left/right motor driver channels swapped
-const uint8_t P_JUNCTION_IR = 24;       // 1 = a side branch only counts if that side's IR saw it too
-const uint8_t P_LINE_WIDTH = 25;        // QTR sensors a normal straight line darkens
+const uint8_t P_JUNCTION_IR = 24;       // (unused: junctions use the QTR only)
+const uint8_t P_LINE_WIDTH = 25;        // (unused)
 const uint8_t P_IR_STABLE = 26;         // ms an IR must stay black (and white) to count: kills flicker
 const uint8_t PARAM_COUNT = 26;
 struct ParamDef { uint8_t minV, maxV, def; };
@@ -397,11 +396,9 @@ bool lineWasLost = false;
 // ---- Junction detection (shape based, see updateLineEvents) ----
 const uint8_t JT_NONE = 0, JT_LEFT_CORNER = 1, JT_RIGHT_CORNER = 2, JT_LEFT_BRANCH = 3,
               JT_RIGHT_BRANCH = 4, JT_T = 5, JT_CROSS = 6, JT_BOX = 7;
-const uint8_t JUNCTION_ABRUPT_READINGS = 3;  // wide shape must appear this soon after a centered line
-const uint32_t JUNCTION_IR_EARLY_MS = 150;   // IR may see the branch just before the QTR does
 bool jActive = false;              // crossing a junction / corner shape right now
-bool jLeft = false, jRight = false, jCenterHeld = false, jBoxReported = false;
-uint8_t jWideCount = 0, jClearCount = 0, jSinceCentered = 255;
+bool jLeft = false, jRight = false, jBoxReported = false;
+uint8_t jWideCount = 0, jClearCount = 0;
 uint32_t jStartMs = 0, jAllDarkSinceMs = 0;
 uint8_t jDoneType = JT_NONE;       // set for ONE control cycle when a shape is classified
 bool jDoneStraight = false;        // line continues straight ahead after it
@@ -1639,55 +1636,18 @@ void updateInversion(const int *cal) {
   }
 }
 
-// ---------------- Junction detection ----------------
-// Sensor 0 = robot's left. A normal line darkens about P_LINE_WIDTH
-// neighbouring sensors. What the array sees while driving over each shape:
-//
-//   curve          ..##....  stays narrow, slides sideways; the center goes
-//                            white; it widens only gradually
-//   left corner    #####...  wide, from S1 through the center   -> nothing ahead
-//   left branch    #####...                                      -> line ahead
-//   T              ########  wide on both sides                  -> nothing ahead
-//   cross          ########                                      -> line ahead
-//   box / stop     ########  for longer than "Box detection"
-//
-// A junction shape is only accepted when ALL of these hold:
-//   1. just before it the line was narrow and centered (normal following),
-//   2. the wide shape appears suddenly (within 3 readings of that), it is
-//      connected and includes the center, and it lasts P_JUNCTION_CONFIRM
-//      readings in a row,
-//   3. (option) the side IR on that side also saw the branch line.
-// When the wide shape is gone (P_JUNCTION_CONFIRM readings) the sensors
-// look straight ahead: a centered line = there is a straight path.
-// Branch / T / cross count as junctions; corners count as corners only.
-// Curves fail rule 1 or 2 and are never counted.
-
-struct LineShape {
-  int dark;          // sensors over the line
-  int runStart;      // longest connected dark run: first sensor
-  int runEnd;        //                              last sensor
-  int runLen;
-  bool center;       // S4 or S5 dark
-};
-
-LineShape lineShape(const int *cal) {
-  LineShape sh = {0, -1, -1, 0, false};
-  const int thr = EDGE_THRESHOLD;
-  int curStart = -1;
-  for (int s = 0; s < 8; ++s) {
-    const bool dk = cal[s] > thr;
-    if (dk) {
-      sh.dark++;
-      if (curStart < 0) curStart = s;
-      const int len = s - curStart + 1;
-      if (len > sh.runLen) { sh.runLen = len; sh.runStart = curStart; sh.runEnd = s; }
-    } else {
-      curStart = -1;
-    }
-  }
-  sh.center = cal[3] > thr || cal[4] > thr;
-  return sh;
-}
+// ---------------- Junction detection (QTR only) ----------------
+// Sensor 0 = robot's left (S1), 7 = right (S8). Center = S4 or S5.
+//   right path here : S7 + S8 dark AND center dark   (line + branch to the right)
+//   left path here  : S1 + S2 dark AND center dark
+//   both            : T or cross
+// A curve moves the line to the edge, so the center is white: never a junction.
+// Seen for P_JUNCTION_CONFIRM readings in a row = junction starts; the robot
+// collects which sides had a path until both sides are clear again, then
+// looks ahead: center dark = there is also a straight path.
+//   left/right + straight -> branch   (route: next step)
+//   left + right          -> T / cross (route: next step)
+//   only one side, nothing ahead -> plain corner (route: turns by itself)
 
 const char *junctionName(uint8_t t) {
   switch (t) {
@@ -1715,74 +1675,61 @@ void reportJunction(uint8_t type, bool straight) {
 void resetJunction() {
   jActive = false;
   jWideCount = jClearCount = 0;
-  jSinceCentered = 255;
   jAllDarkSinceMs = 0;
   jDoneType = JT_NONE;
 }
 
 void updateJunction(const int *cal) {
   jDoneType = JT_NONE;
-  const LineShape sh = lineShape(cal);
-  const int width = params[P_LINE_WIDTH];
+  const int thr = EDGE_THRESHOLD;
+  bool d[8];
+  int dark = 0;
+  for (int i = 0; i < 8; ++i) { d[i] = cal[i] > thr; if (d[i]) dark++; }
+  const bool center = d[3] || d[4];
+  const bool leftArm = d[0] && d[1] && center;
+  const bool rightArm = d[6] && d[7] && center;
+  const bool arm = leftArm || rightArm;
   const uint8_t confirm = params[P_JUNCTION_CONFIRM];
-  const bool leftArm = sh.runStart == 0 && sh.runEnd >= 3;    // S1 .. center connected
-  const bool rightArm = sh.runEnd == 7 && sh.runStart <= 4;   // center .. S8 connected
-  const bool wide = (leftArm || rightArm) && sh.runLen >= width + 2;
-  const bool centeredNarrow = sh.dark >= 1 && sh.runLen <= width && sh.dark <= width + 1 &&
-                              sh.runStart <= 4 && sh.runEnd >= 3;
   const uint32_t now = millis();
 
   if (!jActive) {
-    if (centeredNarrow) { jSinceCentered = 0; jWideCount = 0; return; }
-    if (jSinceCentered < 255) jSinceCentered++;
-    if (!wide) { jWideCount = 0; return; }
-    // Wide shape: must come suddenly after a centered line (a curve widens slowly).
-    if (jWideCount == 0 && jSinceCentered > JUNCTION_ABRUPT_READINGS) return;
+    if (!arm) { jWideCount = 0; return; }
+    if (jWideCount == 0) { jLeft = false; jRight = false; }
+    jLeft = jLeft || leftArm;
+    jRight = jRight || rightArm;
     if (++jWideCount < confirm) return;
     jActive = true;
-    jLeft = leftArm;
-    jRight = rightArm;
-    jCenterHeld = true;
     jBoxReported = false;
     jClearCount = 0;
     jStartMs = now;
     jAllDarkSinceMs = 0;
+    Serial.printf("Junction start: %s%s\n", jLeft ? "LEFT " : "", jRight ? "RIGHT" : "");
     return;
   }
 
-  // Crossing the shape: collect which sides had a branch.
-  if (wide) {
-    jLeft = jLeft || leftArm;
-    jRight = jRight || rightArm;
-  }
-  if (!sh.center) jCenterHeld = false;
-  if (sh.dark >= 7) { if (jAllDarkSinceMs == 0) jAllDarkSinceMs = now; }
+  // Crossing it: remember every side that had a path.
+  jLeft = jLeft || leftArm;
+  jRight = jRight || rightArm;
+  if (dark >= 7) { if (jAllDarkSinceMs == 0) jAllDarkSinceMs = now; }
   else jAllDarkSinceMs = 0;
   if (!jBoxReported && jAllDarkSinceMs != 0 && now - jAllDarkSinceMs >= BOX_DETECT_MS) {
     jBoxReported = true;               // reported at once, while still inside the box
     reportJunction(JT_BOX, false);
   }
   const bool timedOut = now - jStartMs > JUNCTION_TIMEOUT_MS;
-  if (wide && !timedOut) { jClearCount = 0; return; }
+  const bool sideDark = d[0] || d[7];  // still on the branch line
+  if (sideDark && !timedOut) { jClearCount = 0; return; }
   if (!timedOut && ++jClearCount < confirm) return;
 
-  // Shape passed: look ahead.
+  // Passed it: is there a straight path ahead?
   jActive = false;
   jWideCount = 0;
-  jSinceCentered = centeredNarrow ? 0 : 255;
   if (jBoxReported) return;
-  bool left = jLeft, right = jRight;
-  if (params[P_JUNCTION_IR]) {          // side IR must confirm each branch
-    const uint32_t since = jStartMs - JUNCTION_IR_EARLY_MS;
-    left = left && (int32_t)(irLeftRiseMs - since) >= 0;
-    right = right && (int32_t)(irRightRiseMs - since) >= 0;
-    if (!left && !right) { Serial.println("Junction ignored: no IR confirmation"); return; }
-  }
-  const bool straight = centeredNarrow;
+  const bool straight = center;
   uint8_t type;
-  if (left && right) type = straight ? JT_CROSS : JT_T;
-  else if (straight && jCenterHeld) type = left ? JT_LEFT_BRANCH : JT_RIGHT_BRANCH;
-  else type = left ? JT_LEFT_CORNER : JT_RIGHT_CORNER;
+  if (jLeft && jRight) type = straight ? JT_CROSS : JT_T;
+  else if (straight) type = jLeft ? JT_LEFT_BRANCH : JT_RIGHT_BRANCH;
+  else type = jLeft ? JT_LEFT_CORNER : JT_RIGHT_CORNER;
   reportJunction(type, straight);
 }
 
