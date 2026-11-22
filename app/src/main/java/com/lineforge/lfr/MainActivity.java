@@ -82,12 +82,17 @@ public final class MainActivity extends Activity {
     private static final int P_LINE_THRESHOLD = 1, P_SHARP_TIMEOUT = 2, P_SHARP_END = 3,
             P_IR_TRIGGER = 4, P_IR_SPEED = 5, P_IR_TIMEOUT = 6, P_IR_END = 7, P_IR_DEBOUNCE = 8,
             P_INVERT_MODE = 9, P_INVERT_DARK = 10, P_INVERT_CONFIRM = 11, P_GAP_MIN = 12,
-            P_BOX_DETECT = 13, P_ARM = 14, P_TURN_TIMEOUT = 15, P_JUNCTION_GAP = 16,
+            P_BOX_DETECT = 13, P_ARM = 14, P_TURN_TIMEOUT = 15, P_JUNCTION_CONFIRM = 16,
             P_EDGE_ZONE = 17, P_SHARP_STOP = 18, P_IR_END_SENSOR = 19,
-            P_LEFT_TRIM = 20, P_RIGHT_TRIM = 21, PARAM_COUNT = 21;
+            P_LEFT_TRIM = 20, P_RIGHT_TRIM = 21, P_SENSOR_FLIP = 22, P_MOTOR_SWAP = 23,
+            P_JUNCTION_IR = 24, P_LINE_WIDTH = 25, P_IR_STABLE = 26, PARAM_COUNT = 26;
     /** App unit (%, ms) = firmware value x scale. */
-    private static final int[] PARAM_SCALE = {1, 10, 100, 1, 1, 1, 100, 1, 1, 1, 1, 10, 10, 10, 10, 100, 10, 100, 100, 1, 1, 1};
-    private static final int[] PARAM_DEFAULT = {0, 50, 15, 0, 0, 35, 15, 1, 0, 0, 6, 10, 5, 25, 15, 30, 30, 5, 10, 0, 100, 100};
+    private static final int[] PARAM_SCALE = {1, 10, 100, 1, 1, 1, 100, 1, 1, 1, 1, 10, 10, 10, 10, 100, 1, 100, 100, 1, 1, 1,
+            1, 1, 1, 1, 1};
+    private static final int[] PARAM_DEFAULT = {0, 50, 15, 0, 0, 35, 15, 1, 0, 0, 6, 10, 5, 25, 15, 30, 2, 5, 10, 0, 100, 100,
+            1, 1, 0, 3, 4};
+    private static final String[] JUNCTION_NAMES = {"none", "left corner", "right corner",
+            "left branch + straight", "right branch + straight", "T junction", "cross (+)", "box / stop zone"};
     // Route actions shared with the firmware (command 21: action << 4 | seconds).
     private static final int ACT_LEFT = 1, ACT_RIGHT = 2, ACT_STRAIGHT = 3, ACT_UTURN = 4,
             ACT_WAIT_BLUE = 5, ACT_WAIT_GREEN = 6, ACT_FINISH = 7;
@@ -145,6 +150,7 @@ public final class MainActivity extends Activity {
     private final Segmented[] paramSegs = new Segmented[PARAM_COUNT + 1];
     private LinearLayout invertOptions;
     private final TextView[] counterViews = new TextView[6];
+    private int lastJunctionSeq = -1;
     private TextView lineModeLabel, irLiveLabel;
     private Stepper pivotSpeedStep;
     private boolean bindingRules = false;
@@ -886,7 +892,8 @@ public final class MainActivity extends Activity {
         });
         head.addView(reset);
         c.addView(head, full());
-        c.addView(help("Counted since START, every detection instantly (no time limits). "
+        c.addView(help("Counted since START. Junctions = branches, T and cross only (curves and plain "
+                + "corners are not junctions). Every recognised shape is also written in the Log. "
                 + "Future rules can act on these numbers."));
         c.addView(gap(10));
         String[] names = {"IR left", "IR right", "Junctions", "Left turns", "Right turns", "Gaps"};
@@ -917,6 +924,25 @@ public final class MainActivity extends Activity {
         content.addView(gap(12));
         int flags = preferences.getInt("rule_flags", RULE_KEEP_OLD_CAL);
 
+        // Robot wiring: makes left = the robot's real left everywhere
+        LinearLayout wiring = card();
+        wiring.addView(cardHeader("Robot wiring", "left must mean the robot's left"));
+        wiring.addView(gap(6));
+        wiring.addView(help("Check 1: put the line under the robot's LEFT-most sensor. The position on the "
+                + "Drive tab (live sensors) must be near 0. If it shows ~7000, change Sensor order."));
+        wiring.addView(label("Sensor order"));
+        wiring.addView(paramSeg(P_SENSOR_FLIP, new String[]{"Normal", "Reversed"}).view, full());
+        wiring.addView(gap(10));
+        wiring.addView(help("Check 2: set Left motor to 60% (Drive tab → Wheel balance) and press Drive straight. "
+                + "The robot's LEFT wheel must be the slow one. If the right wheel is slow, change Motor channels."));
+        wiring.addView(label("Motor channels"));
+        wiring.addView(paramSeg(P_MOTOR_SWAP, new String[]{"Normal", "Swapped"}).view, full());
+        wiring.addView(gap(6));
+        wiring.addView(help("Always change both together if PID was already working: changing only one makes "
+                + "the robot steer away from the line."));
+        content.addView(wiring, full());
+        content.addView(gap(12));
+
         // Line sensors: threshold + inverted line (white line on black)
         LinearLayout line = card();
         line.addView(cardHeader("Line sensors", "used by every rule"));
@@ -938,6 +964,30 @@ public final class MainActivity extends Activity {
         line.addView(invertOptions, full());
         updateInvertUi();
         content.addView(line, full());
+        content.addView(gap(12));
+
+        // Junction detection (always on: used by the counters and the route)
+        LinearLayout junc = card();
+        junc.addView(cardHeader("Junction detection", "by the shape the sensors see"));
+        junc.addView(gap(6));
+        junc.addView(help("A junction is accepted only when the line was centered just before, and then "
+                + "suddenly becomes wide from the center to the edge (left, right or both). A curve stays narrow "
+                + "and slides sideways, so it is never a junction. After the wide part the robot looks ahead: "
+                + "line ahead = branch / cross, nothing ahead = corner / T."));
+        junc.addView(gap(12));
+        junc.addView(paramStepper(P_LINE_WIDTH, "Normal line width",
+                "How many of the 8 sensors a straight line darkens (see the live bars)", 1, 5, "sensors", MINT).view, full());
+        junc.addView(gap(12));
+        junc.addView(paramStepper(P_JUNCTION_CONFIRM, "Confirm readings",
+                "Wide shape must be seen this many readings in a row (1 reading = 5 ms). Raise if noise "
+                + "gives false junctions, lower if fast junctions are missed.", 1, 10, "", BLUE).view, full());
+        junc.addView(label("Side IR must confirm branches"));
+        junc.addView(paramSeg(P_JUNCTION_IR, new String[]{"Off", "On"}).view, full());
+        junc.addView(gap(6));
+        junc.addView(help("On: a branch only counts if the IR on that side also saw the black line. The IR "
+                + "sensors sit outside the QTR array, so a curve never reaches them. Use this if curves are "
+                + "still detected as junctions."));
+        content.addView(junc, full());
         content.addView(gap(12));
 
         // Sharp turn recovery (QTR outer sensors)
@@ -978,8 +1028,12 @@ public final class MainActivity extends Activity {
         ir.addView(irLiveLabel, full());
         ir.addView(gap(6));
         ir.addView(help("IR-R detects → turn right with both wheels (left forward, right backward). The moment the "
-                + "IR detects the line again, PID takes over. IR-L mirrors it. No time limits: every detection "
-                + "counts, however short. Detections are always counted on the Drive tab."));
+                + "IR detects the line again, PID takes over. IR-L mirrors it. Detections are always counted "
+                + "on the Drive tab."));
+        ir.addView(gap(12));
+        ir.addView(paramStepper(P_IR_STABLE, "Stable time",
+                "The IR must stay black this long to count (and white as long before the next one). "
+                + "Removes flicker so one line = one count. 0 = count every flicker.", 0, 50, "ms", PURPLE).view, full());
         ir.addView(label("Start turning"));
         ir.addView(paramSeg(P_IR_TRIGGER, new String[]{"When line is lost", "Immediately"}).view, full());
         ir.addView(gap(12));
@@ -1001,8 +1055,8 @@ public final class MainActivity extends Activity {
         routeSwitch = optionSwitch("Competition route", "Fire Rescue: follow the programmed steps",
                 (flags & RULE_ROUTE) != 0, c);
         c.addView(gap(10));
-        c.addView(help("At every junction or box the robot carries out the next step below. "
-                + "Plain 90° corners (only one way to go) are turned automatically and don't use a step. "
+        c.addView(help("At every junction (branch, T, cross) or box the robot carries out the next step below. "
+                + "Curves and plain 90° corners (only one way to go) are followed automatically and don't use a step. "
                 + "Start the robot inside the Start box. While route mode is on, sharp turn recovery is not used."));
         c.addView(gap(16));
 
@@ -2207,6 +2261,12 @@ public final class MainActivity extends Activity {
                     (payload[2] & 255) | ((payload[3] & 255) << 8),
                     payload[4] & 255, payload[5] & 255, payload[6] & 255, payload[7] & 255};
             for (int i = 0; i < 6; i++) counterViews[i].setText(String.valueOf(v[i]));
+            if (payload.length >= 12) {
+                int jt = payload[10] & 255, seq = payload[11] & 255;
+                if (lastJunctionSeq >= 0 && seq != lastJunctionSeq && jt > 0 && jt < JUNCTION_NAMES.length)
+                    addEvent("Junction seen: " + JUNCTION_NAMES[jt]);
+                lastJunctionSeq = seq;
+            }
             int f = payload[8] & 255;
             boolean inverted = (f & 4) != 0;
             lineModeLabel.setText(inverted ? "Line: WHITE line on black floor (inverted)"

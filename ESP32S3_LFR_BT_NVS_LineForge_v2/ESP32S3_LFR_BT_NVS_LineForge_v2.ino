@@ -55,7 +55,7 @@
     [26,0] send all settings (frame type 54)      [27,0] reset counters
     [28,s] wheel-balance test: drive straight at base speed for s seconds (1..10), no PID
     Type 54: settings, one byte per setting id 1..PARAM_COUNT.
-    Type 55: counters: IR-L count u16, IR-R count u16, junctions, left turns,
+    Type 55: counters (12 bytes): IR-L count u16, IR-R count u16, junctions, left turns,
              right turns, gaps, flags (bit0 IR-L sees black, bit1 IR-R,
              bit2 line inverted), inversions.
     [18,value] Sharp-turn spin speed % (10..100)
@@ -97,6 +97,8 @@ struct SpeedRecord;
 struct RuleRecord;
 struct RouteRecord;
 struct ParamRecord;
+struct LineShape;
+struct IrFilter;
 
 // ---------------- User options ----------------
 const bool WAIT_FOR_APP = true;
@@ -135,7 +137,7 @@ const uint8_t P_IR_TRIGGER = 4;         // 0 = turn when line is lost, 1 = turn 
 const uint8_t P_IR_SPEED = 5;           // % spin speed for the IR turn
 const uint8_t P_IR_TIMEOUT = 6;         // (unused: the IR turn has no time settings)
 const uint8_t P_IR_END = 7;             // (unused, replaced by P_IR_END_SENSOR)
-const uint8_t P_IR_DEBOUNCE = 8;        // (unused: every IR detection is recorded)
+const uint8_t P_IR_DEBOUNCE = 8;        // (unused, replaced by P_IR_STABLE)
 const uint8_t P_INVERT_MODE = 9;        // 0 = normal line, 1 = auto detect, 2 = always inverted
 const uint8_t P_INVERT_DARK = 10;       // sensors that must be dark to switch (auto)
 const uint8_t P_INVERT_CONFIRM = 11;    // x10 ms the pattern must last before switching
@@ -143,13 +145,18 @@ const uint8_t P_GAP_MIN = 12;           // (unused: any lost-then-found line is 
 const uint8_t P_BOX_DETECT = 13;        // x10 ms whole array dark = inside a box (route)
 const uint8_t P_ARM = 14;               // x10 ms centered line before the next junction (route)
 const uint8_t P_TURN_TIMEOUT = 15;      // x100 ms route turn gives up
-const uint8_t P_JUNCTION_GAP = 16;      // (unused: every junction is counted)
+const uint8_t P_JUNCTION_CONFIRM = 16;  // readings in a row a junction shape must last (and be gone)
 const uint8_t P_EDGE_ZONE = 17;         // x100: line position <= this (or >= 7000 - this) = at the edge
 const uint8_t P_SHARP_STOP = 18;        // x100: sharp turn stops when the line is within +/- this of 3500
 const uint8_t P_IR_END_SENSOR = 19;     // IR turn stops (PID starts) at: 0 = same IR detects again, 1 = either IR
 const uint8_t P_LEFT_TRIM = 20;         // % of commanded power for the LEFT motor (balance the wheels)
 const uint8_t P_RIGHT_TRIM = 21;        // % of commanded power for the RIGHT motor
-const uint8_t PARAM_COUNT = 21;
+const uint8_t P_SENSOR_FLIP = 22;       // 1 = QTR array mounted mirrored (S1 on the robot's right)
+const uint8_t P_MOTOR_SWAP = 23;        // 1 = left/right motor driver channels swapped
+const uint8_t P_JUNCTION_IR = 24;       // 1 = a side branch only counts if that side's IR saw it too
+const uint8_t P_LINE_WIDTH = 25;        // QTR sensors a normal straight line darkens
+const uint8_t P_IR_STABLE = 26;         // ms an IR must stay black (and white) to count: kills flicker
+const uint8_t PARAM_COUNT = 26;
 struct ParamDef { uint8_t minV, maxV, def; };
 const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
   {0, 0, 0},       // 0 unused
@@ -168,12 +175,17 @@ const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
   {5, 100, 25},    // 13 box detect 250 ms
   {5, 100, 15},    // 14 arm 150 ms
   {5, 100, 30},    // 15 route turn timeout 3 s
-  {5, 100, 30},    // 16 (unused)
+  {1, 10, 2},      // 16 junction confirm: 2 readings
   {1, 30, 5},      // 17 edge zone: position <= 500 / >= 6500
   {0, 35, 10},     // 18 sharp stop: within +/-1000 of center
   {0, 1, 0},       // 19 IR stops at: same IR detects again
   {50, 150, 100},  // 20 left motor trim 100 %
   {50, 150, 100},  // 21 right motor trim 100 %
+  {0, 1, 1},       // 22 sensor order reversed (this robot: yes)
+  {0, 1, 1},       // 23 motor channels swapped (this robot: yes)
+  {0, 1, 0},       // 24 IR confirms branches: off
+  {1, 5, 3},       // 25 normal line width: 3 sensors
+  {0, 50, 4},      // 26 IR stable time 4 ms
 };
 uint8_t params[PARAM_COUNT + 1];
 uint8_t selectedParam = 0;
@@ -358,12 +370,11 @@ const uint32_t IR_TURN_FAILSAFE_MS = 5000;  // safety only: never reached in a n
 // ---- Side IR sensors ----
 bool irLeftActive = false, irRightActive = false;   // debounced: sees black
 bool irLeftRose = false, irRightRose = false;       // new detection, for rules
-// Every detection is caught by a hardware interrupt, so even a very short
-// pulse is recorded while the main loop is busy; updateIR() handles them.
-volatile uint16_t irLeftPending = 0, irRightPending = 0;
-portMUX_TYPE irMux = portMUX_INITIALIZER_UNLOCKED;
-void irLeftIsr();    // declared here: Arduino does not auto-declare IRAM_ATTR functions
-void irRightIsr();
+// Flicker filter: a detection counts only after the module output stayed
+// black for P_IR_STABLE ms; it must stay white as long before the next one.
+struct IrFilter { bool state; bool raw; uint32_t sinceUs; };
+IrFilter irFiltL = {false, false, 0}, irFiltR = {false, false, 0};
+uint32_t irLeftRiseMs = 0, irRightRiseMs = 0;     // when each IR last counted a detection
 int8_t irEdge = 0;                     // -1 = IR-L saw the line last, +1 = IR-R
 
 // ---- Inverted line (white line on black) ----
@@ -382,7 +393,19 @@ RunCounters counters = {};
 bool flagGap = false, flagJunction = false, flagLeftTurn = false, flagRightTurn = false;
 bool flagIrLeft = false, flagIrRight = false;
 bool lineWasLost = false;
-bool junctionActive = false;
+
+// ---- Junction detection (shape based, see updateLineEvents) ----
+const uint8_t JT_NONE = 0, JT_LEFT_CORNER = 1, JT_RIGHT_CORNER = 2, JT_LEFT_BRANCH = 3,
+              JT_RIGHT_BRANCH = 4, JT_T = 5, JT_CROSS = 6, JT_BOX = 7;
+const uint8_t JUNCTION_ABRUPT_READINGS = 3;  // wide shape must appear this soon after a centered line
+const uint32_t JUNCTION_IR_EARLY_MS = 150;   // IR may see the branch just before the QTR does
+bool jActive = false;              // crossing a junction / corner shape right now
+bool jLeft = false, jRight = false, jCenterHeld = false, jBoxReported = false;
+uint8_t jWideCount = 0, jClearCount = 0, jSinceCentered = 255;
+uint32_t jStartMs = 0, jAllDarkSinceMs = 0;
+uint8_t jDoneType = JT_NONE;       // set for ONE control cycle when a shape is classified
+bool jDoneStraight = false;        // line continues straight ahead after it
+uint8_t lastJunctionType = JT_NONE, junctionSeq = 0;   // reported to the app
 
 // ---- Competition route (option bit 2) ----
 const uint8_t RULE_ROUTE = 0x04;
@@ -392,7 +415,7 @@ const uint8_t ACT_LEFT = 1, ACT_RIGHT = 2, ACT_STRAIGHT = 3, ACT_UTURN = 4,
 // Optional external indicator LEDs (-1 = only use the on-board RGB LED).
 const int BLUE_LED_PIN = -1;            // water filled
 const int GREEN_LED_PIN = -1;           // people rescued
-const uint32_t JUNCTION_TIMEOUT_MS = 1500;
+const uint32_t JUNCTION_TIMEOUT_MS = 1500;   // safety: a junction shape never lasts longer
 const uint32_t REVERSE_MS = 250;        // back out of a box before a U-turn
 const uint32_t TURN_LEAVE_MIN_MS = 80;
 const uint32_t UTURN_LEAVE_MIN_MS = 300;
@@ -405,8 +428,8 @@ int routeIdx = 0;
 int routeUploadLeft = 0;
 int turnDelayMs = 100;                  // cmd 22, saved in NVS
 uint8_t routeState = RS_FOLLOW;
-uint32_t routeStateMs = 0, armedSinceMs = 0, fullDarkSinceMs = 0, waitMs = 0;
-bool routeArmed = false, jSawLeft = false, jSawRight = false, turnIsUTurn = false;
+uint32_t routeStateMs = 0, armedSinceMs = 0, waitMs = 0;
+bool routeArmed = false, turnIsUTurn = false;
 int8_t turnDir = 0;
 bool robotOn = false;
 bool pidLast = false;
@@ -713,6 +736,11 @@ int readRaw(int pin) {
   return (int)(sum / 4);
 }
 
+// Logical sensor 0 = the robot's physical LEFT side. When the array is
+// mounted mirrored, logical sensor s is read from QTR channel 7 - s.
+// Calibration (white/black) stays stored per physical channel.
+int qtrChannel(int s) { return params[P_SENSOR_FLIP] ? 7 - s : s; }
+
 void driveMotor(int in1, int in2, int pwmPin, int speed) {
   speed = constrain(speed, -255, 255);
   digitalWrite(in1, (speed >= 0) ? HIGH : LOW);
@@ -725,8 +753,13 @@ void setMotors(int left, int right) {
   left = constrain(left * (int)params[P_LEFT_TRIM] / 100, -255, 255);
   right = constrain(right * (int)params[P_RIGHT_TRIM] / 100, -255, 255);
   lastMotorLeft = left; lastMotorRight = right;
-  driveMotor(AIN1, AIN2, PWMA, left);
-  driveMotor(BIN1, BIN2, PWMB, right);
+  if (params[P_MOTOR_SWAP]) {   // driver channel A is wired to the RIGHT wheel
+    driveMotor(AIN1, AIN2, PWMA, right);
+    driveMotor(BIN1, BIN2, PWMB, left);
+  } else {
+    driveMotor(AIN1, AIN2, PWMA, left);
+    driveMotor(BIN1, BIN2, PWMB, right);
+  }
 }
 
 void stopRobot() {
@@ -767,10 +800,11 @@ void sendFramed(uint8_t type, const uint8_t *payload, uint8_t len) {
 void sendCalibrationFrame() {
   uint8_t p[32];
   for (int i = 0; i < 8; i++) {
-    p[4*i+0] = (uint8_t)(white[i] & 0xff);
-    p[4*i+1] = (uint8_t)(white[i] >> 8);
-    p[4*i+2] = (uint8_t)(black[i] & 0xff);
-    p[4*i+3] = (uint8_t)(black[i] >> 8);
+    const int ch = qtrChannel(i);   // left-to-right as the robot sees it
+    p[4*i+0] = (uint8_t)(white[ch] & 0xff);
+    p[4*i+1] = (uint8_t)(white[ch] >> 8);
+    p[4*i+2] = (uint8_t)(black[ch] & 0xff);
+    p[4*i+3] = (uint8_t)(black[ch] >> 8);
   }
   sendFramed(PKT_CAL, p, sizeof(p));
 }
@@ -789,11 +823,12 @@ void sendSensorFrameIfDue() {
   uint8_t p[16] = {};
   long weighted = 0, total = 0;
   for (int s = 0; s < 8; s++) {
-    int raw = readRaw(QTR[s]);
+    const int ch = qtrChannel(s);
+    int raw = readRaw(QTR[ch]);
     int signal = 0;
-    if (calOk && black[s] - white[s] >= MIN_CAL_RANGE)
-      signal = constrain((int32_t)(raw - white[s]) * 1000 /
-                (black[s] - white[s]), (int32_t)0, (int32_t)1000);
+    if (calOk && black[ch] - white[ch] >= MIN_CAL_RANGE)
+      signal = constrain((int32_t)(raw - white[ch]) * 1000 /
+                (black[ch] - white[ch]), (int32_t)0, (int32_t)1000);
     else
       signal = raw * 1000L / 4095L;
     if (lineInverted && calOk) signal = 1000 - signal;  // show the line, not the floor
@@ -1241,8 +1276,6 @@ void setup() {
   pinMode(IR_LEFT, INPUT);
   pinMode(IR_RIGHT, INPUT);
   defaultParams();
-  attachInterrupt(digitalPinToInterrupt(IR_LEFT), irLeftIsr, IR_BLACK == HIGH ? RISING : FALLING);
-  attachInterrupt(digitalPinToInterrupt(IR_RIGHT), irRightIsr, IR_BLACK == HIGH ? RISING : FALLING);
   if (BLUE_LED_PIN >= 0) { pinMode(BLUE_LED_PIN, OUTPUT); digitalWrite(BLUE_LED_PIN, LOW); }
   if (GREEN_LED_PIN >= 0) { pinMode(GREEN_LED_PIN, OUTPUT); digitalWrite(GREEN_LED_PIN, LOW); }
 
@@ -1310,9 +1343,9 @@ void setup() {
 }
 
 // ---------------- Competition route engine ----------------
-// The robot follows the line with PID. When a side of the array (S1+S2 or
-// S7+S8) turns dark it drives straight through the junction, noting which
-// sides had a branch, then decides:
+// The robot follows the line with PID. When the junction detector (see
+// updateJunction) sees a junction shape it drives straight across it,
+// then decides:
 //   - only one side and nothing ahead = plain 90-degree corner: turn there
 //     automatically (no route step used);
 //   - otherwise (branch with a straight path, T, cross, or a box border)
@@ -1408,13 +1441,10 @@ void routeNextStep(bool straightAhead) {
 }
 
 // Returns true when the route engine drives the motors this cycle (PID skipped).
+// Junctions come from the shape detector (updateJunction, run just before).
 bool routeStep(const int *cal, int32_t total) {
   bool d[8];
-  int darkCount = 0;
-  for (int s = 0; s < 8; ++s) {
-    d[s] = cal[s] > EDGE_THRESHOLD;
-    if (d[s]) darkCount++;
-  }
+  for (int s = 0; s < 8; ++s) d[s] = cal[s] > EDGE_THRESHOLD;
   const bool center = d[3] || d[4];
   const bool leftSide = d[0] && d[1];
   const bool rightSide = d[6] && d[7];
@@ -1426,6 +1456,7 @@ bool routeStep(const int *cal, int32_t total) {
 
   switch (routeState) {
     case RS_FOLLOW:
+    case RS_JUNCTION:
       if (!routeArmed) {
         // Need a normal, centered line first (leaving the start box or a turn).
         if (center && !leftSide && !rightSide) {
@@ -1436,34 +1467,21 @@ bool routeStep(const int *cal, int32_t total) {
         }
         return false;
       }
-      if (leftSide || rightSide) {
-        jSawLeft = leftSide;
-        jSawRight = rightSide;
-        fullDarkSinceMs = 0;
-        enterRouteState(RS_JUNCTION);
-        setMotors(fwd, fwd);
+      if (jDoneType == JT_LEFT_CORNER || jDoneType == JT_RIGHT_CORNER) {
+        routeStartTurn(jDoneType == JT_LEFT_CORNER ? -1 : 1, false);  // only one way: no step used
         return true;
       }
+      if (jDoneType != JT_NONE) {       // branch, T, cross or box: next programmed step
+        routeNextStep(jDoneStraight);
+        return routeState != RS_FOLLOW || !robotOn;
+      }
+      if (jActive) {
+        if (routeState != RS_JUNCTION) enterRouteState(RS_JUNCTION);
+        setMotors(fwd, fwd);            // roll straight across while it is classified
+        return true;
+      }
+      if (routeState == RS_JUNCTION) enterRouteState(RS_FOLLOW);   // shape ignored (IR option)
       return false;
-
-    case RS_JUNCTION: {
-      jSawLeft = jSawLeft || leftSide;
-      jSawRight = jSawRight || rightSide;
-      if (darkCount >= 7) { if (fullDarkSinceMs == 0) fullDarkSinceMs = now; }
-      else fullDarkSinceMs = 0;
-      const bool inBox = fullDarkSinceMs != 0 && now - fullDarkSinceMs >= BOX_DETECT_MS;
-      if (!inBox && (leftSide || rightSide) && inState < JUNCTION_TIMEOUT_MS) {
-        setMotors(fwd, fwd);   // keep rolling straight through the junction
-        return true;
-      }
-      const bool straightAhead = center && !inBox;
-      if (!inBox && !straightAhead && jSawLeft != jSawRight) {
-        routeStartTurn(jSawLeft ? -1 : 1, false);  // plain corner: only one way
-        return true;
-      }
-      routeNextStep(straightAhead);
-      return routeState != RS_FOLLOW || !robotOn;
-    }
 
     case RS_REVERSE:
       if (inState < REVERSE_MS) { setMotors(-fwd, -fwd); return true; }
@@ -1534,12 +1552,13 @@ void resetCounters() {
   flagGap = flagJunction = flagLeftTurn = flagRightTurn = false;
   flagIrLeft = flagIrRight = false;
   lineWasLost = false;
-  junctionActive = false;
+  resetJunction();
+  lastJunctionType = JT_NONE;
   irEdge = 0;
 }
 
 void sendCountersFrame() {
-  uint8_t p[10];
+  uint8_t p[12];
   p[0] = (uint8_t)(counters.irLeft & 255);  p[1] = (uint8_t)(counters.irLeft >> 8);
   p[2] = (uint8_t)(counters.irRight & 255); p[3] = (uint8_t)(counters.irRight >> 8);
   p[4] = counters.junctions;
@@ -1548,6 +1567,8 @@ void sendCountersFrame() {
   p[7] = counters.gaps;
   p[8] = (irLeftActive ? 1 : 0) | (irRightActive ? 2 : 0) | (lineInverted ? 4 : 0);
   p[9] = counters.inversions;
+  p[10] = lastJunctionType;   // JT_* of the last shape the robot recognised
+  p[11] = junctionSeq;        // +1 per recognised shape (app logs each one)
   sendFramed(PKT_COUNTERS, p, sizeof(p));
 }
 
@@ -1555,32 +1576,35 @@ void sendParamsFrame() {
   sendFramed(PKT_PARAMS, &params[1], PARAM_COUNT);
 }
 
-// IR interrupt handlers: run the instant a sensor starts seeing black.
-// No time filter: every detection is recorded, however short.
-void IRAM_ATTR irLeftIsr() {
-  portENTER_CRITICAL_ISR(&irMux);
-  if (irLeftPending < 65535) irLeftPending = irLeftPending + 1;
-  portEXIT_CRITICAL_ISR(&irMux);
+// One IR channel: the output must stay at a new level for P_IR_STABLE ms
+// before it is accepted. Flicker on the edge of a line or motor noise never
+// lasts that long, so one line crossing = exactly one count.
+// Returns true when a new black detection is accepted.
+bool irFilterUpdate(IrFilter &f, bool black, uint32_t nowUs) {
+  const uint32_t stableUs = (uint32_t)params[P_IR_STABLE] * 1000U;
+  if (black != f.raw) { f.raw = black; f.sinceUs = nowUs; }
+  if (f.raw != f.state && (uint32_t)(nowUs - f.sinceUs) >= stableUs) {
+    f.state = f.raw;
+    return f.state;
+  }
+  return false;
 }
 
-void IRAM_ATTR irRightIsr() {
-  portENTER_CRITICAL_ISR(&irMux);
-  if (irRightPending < 65535) irRightPending = irRightPending + 1;
-  portEXIT_CRITICAL_ISR(&irMux);
-}
-
-// Counts every detection recorded by the interrupts (none are lost, however
-// short) and refreshes the live "sees black" state.
+// Polled every loop pass (many times per millisecond).
 void updateIR() {
-  irLeftActive = digitalRead(IR_LEFT) == IR_BLACK;
-  irRightActive = digitalRead(IR_RIGHT) == IR_BLACK;
-  portENTER_CRITICAL(&irMux);
-  uint16_t l = irLeftPending, r = irRightPending;
-  irLeftPending = 0;
-  irRightPending = 0;
-  portEXIT_CRITICAL(&irMux);
-  while (l > 0) { irLeftRose = true; robotEvent(EV_IR_LEFT); l--; }
-  while (r > 0) { irRightRose = true; robotEvent(EV_IR_RIGHT); r--; }
+  const uint32_t nowUs = micros();
+  if (irFilterUpdate(irFiltL, digitalRead(IR_LEFT) == IR_BLACK, nowUs)) {
+    irLeftRose = true;
+    irLeftRiseMs = millis();
+    robotEvent(EV_IR_LEFT);
+  }
+  if (irFilterUpdate(irFiltR, digitalRead(IR_RIGHT) == IR_BLACK, nowUs)) {
+    irRightRose = true;
+    irRightRiseMs = millis();
+    robotEvent(EV_IR_RIGHT);
+  }
+  irLeftActive = irFiltL.state;
+  irRightActive = irFiltR.state;
 }
 
 // Inverted line: in "auto" mode, when most sensors are dark but at least one
@@ -1615,18 +1639,156 @@ void updateInversion(const int *cal) {
   }
 }
 
-// Counts junctions (both sides dark) and gaps (line lost, then found again
-// without a recovery turn). Purely value based, no time windows, so nothing
-// is missed at high speed.
-void updateLineEvents(const int *cal, int32_t total) {
-  const int thr = EDGE_THRESHOLD;
-  int dark = 0;
-  for (int s = 0; s < 8; ++s) if (cal[s] > thr) dark++;
-  const bool bothSides = cal[0] > thr && cal[1] > thr && cal[6] > thr && cal[7] > thr;
-  const bool junction = bothSides || dark >= 7;
-  if (junction && !junctionActive) robotEvent(EV_JUNCTION);
-  junctionActive = junction;
+// ---------------- Junction detection ----------------
+// Sensor 0 = robot's left. A normal line darkens about P_LINE_WIDTH
+// neighbouring sensors. What the array sees while driving over each shape:
+//
+//   curve          ..##....  stays narrow, slides sideways; the center goes
+//                            white; it widens only gradually
+//   left corner    #####...  wide, from S1 through the center   -> nothing ahead
+//   left branch    #####...                                      -> line ahead
+//   T              ########  wide on both sides                  -> nothing ahead
+//   cross          ########                                      -> line ahead
+//   box / stop     ########  for longer than "Box detection"
+//
+// A junction shape is only accepted when ALL of these hold:
+//   1. just before it the line was narrow and centered (normal following),
+//   2. the wide shape appears suddenly (within 3 readings of that), it is
+//      connected and includes the center, and it lasts P_JUNCTION_CONFIRM
+//      readings in a row,
+//   3. (option) the side IR on that side also saw the branch line.
+// When the wide shape is gone (P_JUNCTION_CONFIRM readings) the sensors
+// look straight ahead: a centered line = there is a straight path.
+// Branch / T / cross count as junctions; corners count as corners only.
+// Curves fail rule 1 or 2 and are never counted.
 
+struct LineShape {
+  int dark;          // sensors over the line
+  int runStart;      // longest connected dark run: first sensor
+  int runEnd;        //                              last sensor
+  int runLen;
+  bool center;       // S4 or S5 dark
+};
+
+LineShape lineShape(const int *cal) {
+  LineShape sh = {0, -1, -1, 0, false};
+  const int thr = EDGE_THRESHOLD;
+  int curStart = -1;
+  for (int s = 0; s < 8; ++s) {
+    const bool dk = cal[s] > thr;
+    if (dk) {
+      sh.dark++;
+      if (curStart < 0) curStart = s;
+      const int len = s - curStart + 1;
+      if (len > sh.runLen) { sh.runLen = len; sh.runStart = curStart; sh.runEnd = s; }
+    } else {
+      curStart = -1;
+    }
+  }
+  sh.center = cal[3] > thr || cal[4] > thr;
+  return sh;
+}
+
+const char *junctionName(uint8_t t) {
+  switch (t) {
+    case JT_LEFT_CORNER:  return "left corner";
+    case JT_RIGHT_CORNER: return "right corner";
+    case JT_LEFT_BRANCH:  return "left branch + straight";
+    case JT_RIGHT_BRANCH: return "right branch + straight";
+    case JT_T:            return "T junction";
+    case JT_CROSS:        return "cross (+)";
+    case JT_BOX:          return "box / stop zone";
+    default:              return "none";
+  }
+}
+
+void reportJunction(uint8_t type, bool straight) {
+  jDoneType = type;
+  jDoneStraight = straight;
+  lastJunctionType = type;
+  junctionSeq++;
+  if (type == JT_LEFT_BRANCH || type == JT_RIGHT_BRANCH || type == JT_T || type == JT_CROSS)
+    robotEvent(EV_JUNCTION);
+  Serial.printf("Junction: %s\n", junctionName(type));
+}
+
+void resetJunction() {
+  jActive = false;
+  jWideCount = jClearCount = 0;
+  jSinceCentered = 255;
+  jAllDarkSinceMs = 0;
+  jDoneType = JT_NONE;
+}
+
+void updateJunction(const int *cal) {
+  jDoneType = JT_NONE;
+  const LineShape sh = lineShape(cal);
+  const int width = params[P_LINE_WIDTH];
+  const uint8_t confirm = params[P_JUNCTION_CONFIRM];
+  const bool leftArm = sh.runStart == 0 && sh.runEnd >= 3;    // S1 .. center connected
+  const bool rightArm = sh.runEnd == 7 && sh.runStart <= 4;   // center .. S8 connected
+  const bool wide = (leftArm || rightArm) && sh.runLen >= width + 2;
+  const bool centeredNarrow = sh.dark >= 1 && sh.runLen <= width && sh.dark <= width + 1 &&
+                              sh.runStart <= 4 && sh.runEnd >= 3;
+  const uint32_t now = millis();
+
+  if (!jActive) {
+    if (centeredNarrow) { jSinceCentered = 0; jWideCount = 0; return; }
+    if (jSinceCentered < 255) jSinceCentered++;
+    if (!wide) { jWideCount = 0; return; }
+    // Wide shape: must come suddenly after a centered line (a curve widens slowly).
+    if (jWideCount == 0 && jSinceCentered > JUNCTION_ABRUPT_READINGS) return;
+    if (++jWideCount < confirm) return;
+    jActive = true;
+    jLeft = leftArm;
+    jRight = rightArm;
+    jCenterHeld = true;
+    jBoxReported = false;
+    jClearCount = 0;
+    jStartMs = now;
+    jAllDarkSinceMs = 0;
+    return;
+  }
+
+  // Crossing the shape: collect which sides had a branch.
+  if (wide) {
+    jLeft = jLeft || leftArm;
+    jRight = jRight || rightArm;
+  }
+  if (!sh.center) jCenterHeld = false;
+  if (sh.dark >= 7) { if (jAllDarkSinceMs == 0) jAllDarkSinceMs = now; }
+  else jAllDarkSinceMs = 0;
+  if (!jBoxReported && jAllDarkSinceMs != 0 && now - jAllDarkSinceMs >= BOX_DETECT_MS) {
+    jBoxReported = true;               // reported at once, while still inside the box
+    reportJunction(JT_BOX, false);
+  }
+  const bool timedOut = now - jStartMs > JUNCTION_TIMEOUT_MS;
+  if (wide && !timedOut) { jClearCount = 0; return; }
+  if (!timedOut && ++jClearCount < confirm) return;
+
+  // Shape passed: look ahead.
+  jActive = false;
+  jWideCount = 0;
+  jSinceCentered = centeredNarrow ? 0 : 255;
+  if (jBoxReported) return;
+  bool left = jLeft, right = jRight;
+  if (params[P_JUNCTION_IR]) {          // side IR must confirm each branch
+    const uint32_t since = jStartMs - JUNCTION_IR_EARLY_MS;
+    left = left && (int32_t)(irLeftRiseMs - since) >= 0;
+    right = right && (int32_t)(irRightRiseMs - since) >= 0;
+    if (!left && !right) { Serial.println("Junction ignored: no IR confirmation"); return; }
+  }
+  const bool straight = centeredNarrow;
+  uint8_t type;
+  if (left && right) type = straight ? JT_CROSS : JT_T;
+  else if (straight && jCenterHeld) type = left ? JT_LEFT_BRANCH : JT_RIGHT_BRANCH;
+  else type = left ? JT_LEFT_CORNER : JT_RIGHT_CORNER;
+  reportJunction(type, straight);
+}
+
+// Junctions (above) and gaps: line lost, then found again without a turn.
+void updateLineEvents(const int *cal, int32_t total) {
+  updateJunction(cal);
   if (total == 0) {
     lineWasLost = true;
   } else {
@@ -1808,9 +1970,10 @@ void loop() {
   int calibrated[8];
   int32_t weighted = 0, total = 0;
   for (int s = 0; s < 8; ++s) {
-    int raw = readRaw(QTR[s]);
-    int32_t span = black[s] - white[s]; // >= MIN_CAL_RANGE if calOk
-    calibrated[s] = constrain((int32_t)(raw - white[s]) * 1000 / span,
+    const int ch = qtrChannel(s);       // s = 0 is the robot's left side
+    int raw = readRaw(QTR[ch]);
+    int32_t span = black[ch] - white[ch]; // >= MIN_CAL_RANGE if calOk
+    calibrated[s] = constrain((int32_t)(raw - white[ch]) * 1000 / span,
                               (int32_t)0, (int32_t)1000);
     if (lineInverted) calibrated[s] = 1000 - calibrated[s];  // white line on black
     if (calibrated[s] > 250) {
