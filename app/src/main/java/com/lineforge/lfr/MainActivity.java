@@ -77,7 +77,7 @@ public final class MainActivity extends Activity {
     private static final int TAB_CALIBRATE = 2, TAB_LOG = 4;
     // Option bits shared with the firmware (command 17).
     private static final int RULE_SHARP_TURN = 0x01, RULE_KEEP_OLD_CAL = 0x02, RULE_ROUTE = 0x04,
-            RULE_IR_TURN = 0x08;
+            RULE_IR_TURN = 0x08, RULE_JUNCTIONS = 0x10;
     // Rule settings shared with the firmware (commands 23/24, frame type 0x54).
     private static final int P_LINE_THRESHOLD = 1, P_SHARP_TIMEOUT = 2, P_SHARP_END = 3,
             P_IR_TRIGGER = 4, P_IR_SPEED = 5, P_IR_TIMEOUT = 6, P_IR_END = 7, P_IR_DEBOUNCE = 8,
@@ -85,12 +85,13 @@ public final class MainActivity extends Activity {
             P_BOX_DETECT = 13, P_ARM = 14, P_TURN_TIMEOUT = 15, P_JUNCTION_CONFIRM = 16,
             P_EDGE_ZONE = 17, P_SHARP_STOP = 18, P_IR_END_SENSOR = 19,
             P_LEFT_TRIM = 20, P_RIGHT_TRIM = 21, P_SENSOR_FLIP = 22, P_MOTOR_SWAP = 23,
-            P_JUNCTION_IR = 24, P_LINE_WIDTH = 25, P_IR_STABLE = 26, PARAM_COUNT = 26;
+            P_JUNCTION_IR = 24, P_LINE_WIDTH = 25, P_IR_STABLE = 26, P_LOOKAHEAD = 27,
+            P_JUNCTION_PREFER = 28, P_JUNCTION_USE_IR = 29, PARAM_COUNT = 29;
     /** App unit (%, ms) = firmware value x scale. */
     private static final int[] PARAM_SCALE = {1, 10, 100, 1, 1, 1, 100, 1, 1, 1, 1, 10, 10, 10, 10, 100, 1, 100, 100, 1, 1, 1,
-            1, 1, 1, 1, 1};
+            1, 1, 1, 1, 1, 10, 1, 1};
     private static final int[] PARAM_DEFAULT = {0, 50, 15, 0, 0, 35, 15, 1, 0, 0, 6, 10, 5, 25, 15, 30, 2, 5, 10, 0, 100, 100,
-            1, 1, 0, 3, 4};
+            1, 1, 0, 3, 4, 3, 0, 1};
     private static final String[] JUNCTION_NAMES = {"none", "left corner", "right corner",
             "left branch + straight", "right branch + straight", "T junction", "cross (+)", "box / stop zone"};
     // Route actions shared with the firmware (command 21: action << 4 | seconds).
@@ -145,7 +146,7 @@ public final class MainActivity extends Activity {
     private Button calStartButton;
     private boolean calibrating = false;
     // Rules + saved-calibration options
-    private Toggle sharpTurnSwitch, keepOldCalSwitch, irTurnSwitch;
+    private Toggle sharpTurnSwitch, keepOldCalSwitch, irTurnSwitch, junctionSwitch;
     private final Stepper[] paramSteppers = new Stepper[PARAM_COUNT + 1];
     private final Segmented[] paramSegs = new Segmented[PARAM_COUNT + 1];
     private LinearLayout invertOptions;
@@ -966,14 +967,35 @@ public final class MainActivity extends Activity {
         content.addView(line, full());
         content.addView(gap(12));
 
-        // Junction detection (always on: used by the counters and the route)
+        // Junctions: detection (QTR + IR) and the robot's own choice when route is off
         LinearLayout junc = card();
-        junc.addView(cardHeader("Junction detection", "QTR sensors only"));
+        junctionSwitch = optionSwitch("Decide at junctions", "Route OFF: robot picks the path itself",
+                (flags & RULE_JUNCTIONS) != 0, junc);
+        junc.addView(gap(8));
+        junc.addView(help("Right path = S7 + S8 dark together with the center (S4/S5), and IR-R sees the line. "
+                + "Left path mirrors it. After the side sensors are white again the robot drives on a few mm "
+                + "(look-ahead) and checks the center: line still there = junction (branch / cross), "
+                + "line ended = 90° corner (or T when both sides had a path). Corners are always turned."));
         junc.addView(gap(6));
-        junc.addView(help("Uses the QTR sensors only. Right path = S7 + S8 dark while the center (S4/S5) "
-                + "is also dark; left path = S1 + S2 dark with the center. A curve moves the line to the edge "
-                + "and the center goes white, so it is not a junction. After passing it the robot looks ahead: "
-                + "center dark = there is also a straight path. In route mode the next step decides where to go."));
+        junc.addView(help("Competition route ON: at every junction the next route step decides (this switch is "
+                + "not needed). Route OFF and this switch ON: the choice below decides. While this switch is ON "
+                + "the IR turn rule is not used: the IR sensors help detect junctions instead."));
+        junc.addView(label("At a choice, go"));
+        junc.addView(paramSeg(P_JUNCTION_PREFER,
+                new String[]{"Straight, else L", "Straight, else R", "Left first", "Right first"}).view, full());
+        junc.addView(gap(6));
+        junc.addView(help("Straight, else L: branch → straight, T → left.  Left first: left whenever there is a "
+                + "left path, else straight, else right.  (Right options mirror it.)"));
+        junc.addView(label("Side IR must also see a side path"));
+        junc.addView(paramSeg(P_JUNCTION_USE_IR, new String[]{"Off (QTR only)", "On (QTR + IR)"}).view, full());
+        junc.addView(gap(6));
+        junc.addView(help("On: when there is a straight path too, a side path only counts if that side's IR saw the "
+                + "line, so curves are never junctions. A plain corner (line ends) is turned even without IR."));
+        junc.addView(gap(12));
+        junc.addView(paramStepper(P_LOOKAHEAD, "Look-ahead",
+                "Drive on this long after the side path before checking if the line goes on. "
+                + "Raise if corners are mistaken for junctions, lower if the robot overshoots.",
+                0, 30, "ms", MINT).view, full());
         junc.addView(gap(12));
         junc.addView(paramStepper(P_JUNCTION_CONFIRM, "Confirm readings",
                 "The pattern must be seen this many readings in a row (1 reading = 5 ms). Raise if noise "
@@ -1344,6 +1366,7 @@ public final class MainActivity extends Activity {
         if (keepOldCalSwitch != null && keepOldCalSwitch.isChecked()) f |= RULE_KEEP_OLD_CAL;
         if (routeSwitch != null && routeSwitch.isChecked()) f |= RULE_ROUTE;
         if (irTurnSwitch != null && irTurnSwitch.isChecked()) f |= RULE_IR_TURN;
+        if (junctionSwitch != null && junctionSwitch.isChecked()) f |= RULE_JUNCTIONS;
         return f;
     }
 
@@ -1358,7 +1381,8 @@ public final class MainActivity extends Activity {
         if (log) addEvent("Rules sent: sharp turn " + (sharpTurnSwitch.isChecked() ? "ON" : "OFF")
                 + " (spin " + pivotSpeedStep.get() + "%), keep previous calibration "
                 + (keepOldCalSwitch.isChecked() ? "ON" : "OFF") + ", IR turn "
-                + (irTurnSwitch != null && irTurnSwitch.isChecked() ? "ON" : "OFF") + ", route mode "
+                + (irTurnSwitch != null && irTurnSwitch.isChecked() ? "ON" : "OFF") + ", junction decisions "
+                + (junctionSwitch != null && junctionSwitch.isChecked() ? "ON" : "OFF") + ", route mode "
                 + (routeSwitch != null && routeSwitch.isChecked() ? "ON" : "OFF") + ".");
     }
 
@@ -1369,6 +1393,7 @@ public final class MainActivity extends Activity {
         keepOldCalSwitch.setChecked((flags & RULE_KEEP_OLD_CAL) != 0);
         if (routeSwitch != null) routeSwitch.setChecked((flags & RULE_ROUTE) != 0);
         if (irTurnSwitch != null) irTurnSwitch.setChecked((flags & RULE_IR_TURN) != 0);
+        if (junctionSwitch != null) junctionSwitch.setChecked((flags & RULE_JUNCTIONS) != 0);
         bindingRules = false;
         if (pivot >= 10 && pivot <= 100) pivotSpeedStep.set(pivot);
         saveRuleOptions();

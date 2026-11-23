@@ -155,7 +155,10 @@ const uint8_t P_MOTOR_SWAP = 23;        // 1 = left/right motor driver channels 
 const uint8_t P_JUNCTION_IR = 24;       // (unused: junctions use the QTR only)
 const uint8_t P_LINE_WIDTH = 25;        // (unused)
 const uint8_t P_IR_STABLE = 26;         // ms an IR must stay black (and white) to count: kills flicker
-const uint8_t PARAM_COUNT = 26;
+const uint8_t P_LOOKAHEAD = 27;         // x10 ms: drive on after a side path before looking ahead
+const uint8_t P_JUNCTION_PREFER = 28;   // route OFF: 0 straight>left, 1 straight>right, 2 left first, 3 right first
+const uint8_t P_JUNCTION_USE_IR = 29;   // 1 = side IR must also see a side path (when there is a choice)
+const uint8_t PARAM_COUNT = 29;
 struct ParamDef { uint8_t minV, maxV, def; };
 const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
   {0, 0, 0},       // 0 unused
@@ -185,6 +188,9 @@ const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
   {0, 1, 0},       // 24 IR confirms branches: off
   {1, 5, 3},       // 25 normal line width: 3 sensors
   {0, 50, 4},      // 26 IR stable time 4 ms
+  {0, 30, 3},      // 27 look-ahead 30 ms
+  {0, 3, 0},       // 28 route OFF choice: straight, else left
+  {0, 1, 1},       // 29 IR confirms side paths: on
 };
 uint8_t params[PARAM_COUNT + 1];
 uint8_t selectedParam = 0;
@@ -360,6 +366,7 @@ int8_t lastEdge = 0;                    // -1 = S1 (left) saw line last, +1 = S8
 int8_t pivotDir = 0;                    // 0 = not pivoting, -1 left, +1 right
 uint32_t pivotStartMs = 0;
 const uint8_t RULE_IR_TURN = 0x08;
+const uint8_t RULE_JUNCTIONS = 0x10;    // route OFF: decide at junctions by P_JUNCTION_PREFER
 const uint8_t SRC_SHARP = 0, SRC_IR = 1;
 uint8_t pivotSource = SRC_SHARP;         // which rule started the current spin
 uint32_t straightTestEndMs = 0;         // wheel-balance test running until this time (0 = off)
@@ -398,6 +405,9 @@ const uint8_t JT_NONE = 0, JT_LEFT_CORNER = 1, JT_RIGHT_CORNER = 2, JT_LEFT_BRAN
               JT_RIGHT_BRANCH = 4, JT_T = 5, JT_CROSS = 6, JT_BOX = 7;
 bool jActive = false;              // crossing a junction / corner shape right now
 bool jLeft = false, jRight = false, jBoxReported = false;
+bool jLooking = false, jIrL = false, jIrR = false;   // look-ahead phase, IR saw a side path
+uint32_t jLookStartMs = 0;
+const uint32_t JUNCTION_IR_EARLY_MS = 150;  // IR may see the side path just before the QTR
 uint8_t jWideCount = 0, jClearCount = 0;
 uint32_t jStartMs = 0, jAllDarkSinceMs = 0;
 uint8_t jDoneType = JT_NONE;       // set for ONE control cycle when a shape is classified
@@ -1064,7 +1074,7 @@ void readBluetooth() {
         lastUs = micros();
         startPulseAtMs = millis();
         startPulseActive = START_PULSE_MS > 0;
-        if (ruleFlags & RULE_ROUTE) routeReset();
+        if (ruleFlags & (RULE_ROUTE | RULE_JUNCTIONS)) routeReset();
         resetCounters();
         lineInverted = params[P_INVERT_MODE] == 2;
 
@@ -1437,6 +1447,23 @@ void routeNextStep(bool straightAhead) {
   }
 }
 
+// Route OFF + "Decide at junctions": pick a path by the preference setting.
+void junctionAutoChoice(uint8_t type, bool straight) {
+  if (type == JT_BOX) { routeBackToFollow(); return; }
+  const bool hasL = type == JT_LEFT_BRANCH || type == JT_T || type == JT_CROSS;
+  const bool hasR = type == JT_RIGHT_BRANCH || type == JT_T || type == JT_CROSS;
+  int8_t dir;   // -1 left, 0 straight, +1 right
+  switch (params[P_JUNCTION_PREFER]) {
+    case 0:  dir = straight ? 0 : (hasL ? -1 : 1); break;   // straight, else left
+    case 1:  dir = straight ? 0 : (hasR ? 1 : -1); break;   // straight, else right
+    case 2:  dir = hasL ? -1 : (straight ? 0 : 1); break;   // left first
+    default: dir = hasR ? 1 : (straight ? 0 : -1); break;   // right first
+  }
+  Serial.printf("Junction choice: %s\n", dir < 0 ? "LEFT" : dir > 0 ? "RIGHT" : "STRAIGHT");
+  if (dir == 0) routeBackToFollow();
+  else routeStartTurn(dir, false);
+}
+
 // Returns true when the route engine drives the motors this cycle (PID skipped).
 // Junctions come from the shape detector (updateJunction, run just before).
 bool routeStep(const int *cal, int32_t total) {
@@ -1468,8 +1495,9 @@ bool routeStep(const int *cal, int32_t total) {
         routeStartTurn(jDoneType == JT_LEFT_CORNER ? -1 : 1, false);  // only one way: no step used
         return true;
       }
-      if (jDoneType != JT_NONE) {       // branch, T, cross or box: next programmed step
-        routeNextStep(jDoneStraight);
+      if (jDoneType != JT_NONE) {       // branch, T, cross or box
+        if (ruleFlags & RULE_ROUTE) routeNextStep(jDoneStraight);   // next programmed step
+        else junctionAutoChoice(jDoneType, jDoneStraight);          // decide by preference
         return routeState != RS_FOLLOW || !robotOn;
       }
       if (jActive) {
@@ -1636,18 +1664,18 @@ void updateInversion(const int *cal) {
   }
 }
 
-// ---------------- Junction detection (QTR only) ----------------
+// ---------------- Junction detection (QTR + side IR) ----------------
 // Sensor 0 = robot's left (S1), 7 = right (S8). Center = S4 or S5.
-//   right path here : S7 + S8 dark AND center dark   (line + branch to the right)
-//   left path here  : S1 + S2 dark AND center dark
-//   both            : T or cross
-// A curve moves the line to the edge, so the center is white: never a junction.
-// Seen for P_JUNCTION_CONFIRM readings in a row = junction starts; the robot
-// collects which sides had a path until both sides are clear again, then
-// looks ahead: center dark = there is also a straight path.
-//   left/right + straight -> branch   (route: next step)
-//   left + right          -> T / cross (route: next step)
-//   only one side, nothing ahead -> plain corner (route: turns by itself)
+//   right path : S7 + S8 dark while the center is dark, and IR-R sees the line
+//   left path  : S1 + S2 dark while the center is dark, and IR-L sees the line
+// When the side sensors are white again the robot drives on a few mm
+// (look-ahead) in a straight line, then looks at the center:
+//   center dark  -> the line goes on: junction (branch, or cross if both sides)
+//   center white -> the line ended: 90-degree corner (or T if both sides)
+// A curve moves the line to the edge with the center white, and (with the IR
+// option) a side path also needs the side IR, so curves are not junctions.
+// Route ON : branch / T / cross / box -> next route step; corner -> turn.
+// Route OFF + "Decide at junctions": corner -> turn; choices -> P_JUNCTION_PREFER.
 
 const char *junctionName(uint8_t t) {
   switch (t) {
@@ -1674,6 +1702,7 @@ void reportJunction(uint8_t type, bool straight) {
 
 void resetJunction() {
   jActive = false;
+  jLooking = false;
   jWideCount = jClearCount = 0;
   jAllDarkSinceMs = 0;
   jDoneType = JT_NONE;
@@ -1681,6 +1710,11 @@ void resetJunction() {
 
 void updateJunction(const int *cal) {
   jDoneType = JT_NONE;
+  // Only while following the line (not while turning, waiting or spinning).
+  if (pivotDir != 0 || (routeState != RS_FOLLOW && routeState != RS_JUNCTION)) {
+    resetJunction();
+    return;
+  }
   const int thr = EDGE_THRESHOLD;
   bool d[8];
   int dark = 0;
@@ -1688,48 +1722,75 @@ void updateJunction(const int *cal) {
   const bool center = d[3] || d[4];
   const bool leftArm = d[0] && d[1] && center;
   const bool rightArm = d[6] && d[7] && center;
-  const bool arm = leftArm || rightArm;
   const uint8_t confirm = params[P_JUNCTION_CONFIRM];
   const uint32_t now = millis();
 
   if (!jActive) {
-    if (!arm) { jWideCount = 0; return; }
+    if (!leftArm && !rightArm) { jWideCount = 0; return; }
     if (jWideCount == 0) { jLeft = false; jRight = false; }
     jLeft = jLeft || leftArm;
     jRight = jRight || rightArm;
     if (++jWideCount < confirm) return;
     jActive = true;
+    jLooking = false;
     jBoxReported = false;
     jClearCount = 0;
     jStartMs = now;
     jAllDarkSinceMs = 0;
+    jIrL = irLeftActive;
+    jIrR = irRightActive;
     Serial.printf("Junction start: %s%s\n", jLeft ? "LEFT " : "", jRight ? "RIGHT" : "");
     return;
   }
 
-  // Crossing it: remember every side that had a path.
-  jLeft = jLeft || leftArm;
-  jRight = jRight || rightArm;
-  if (dark >= 7) { if (jAllDarkSinceMs == 0) jAllDarkSinceMs = now; }
-  else jAllDarkSinceMs = 0;
-  if (!jBoxReported && jAllDarkSinceMs != 0 && now - jAllDarkSinceMs >= BOX_DETECT_MS) {
-    jBoxReported = true;               // reported at once, while still inside the box
-    reportJunction(JT_BOX, false);
-  }
-  const bool timedOut = now - jStartMs > JUNCTION_TIMEOUT_MS;
-  const bool sideDark = d[0] || d[7];  // still on the branch line
-  if (sideDark && !timedOut) { jClearCount = 0; return; }
-  if (!timedOut && ++jClearCount < confirm) return;
+  jIrL = jIrL || irLeftActive;
+  jIrR = jIrR || irRightActive;
 
-  // Passed it: is there a straight path ahead?
+  if (!jLooking) {
+    // Crossing the side path(s): remember every side that had one.
+    jLeft = jLeft || leftArm;
+    jRight = jRight || rightArm;
+    if (dark >= 7) { if (jAllDarkSinceMs == 0) jAllDarkSinceMs = now; }
+    else jAllDarkSinceMs = 0;
+    if (!jBoxReported && jAllDarkSinceMs != 0 && now - jAllDarkSinceMs >= BOX_DETECT_MS) {
+      jBoxReported = true;             // reported at once, while still inside the box
+      reportJunction(JT_BOX, false);
+    }
+    const bool timedOut = now - jStartMs > JUNCTION_TIMEOUT_MS;
+    const bool sideDark = d[0] || d[7];  // still on the side line
+    if (sideDark && !timedOut) { jClearCount = 0; return; }
+    if (!timedOut && ++jClearCount < confirm) return;
+    if (jBoxReported) { resetJunction(); return; }
+    jLooking = true;                   // side is clear: drive on a little
+    jLookStartMs = now;
+  }
+  if (now - jLookStartMs < (uint32_t)params[P_LOOKAHEAD] * 10U) return;
+
+  // Look ahead: does the line go on?
   jActive = false;
+  jLooking = false;
   jWideCount = 0;
-  if (jBoxReported) return;
   const bool straight = center;
+  bool left = jLeft, right = jRight;
+  if (params[P_JUNCTION_USE_IR]) {
+    const uint32_t since = jStartMs - JUNCTION_IR_EARLY_MS;
+    const bool irL = jIrL || (int32_t)(irLeftRiseMs - since) >= 0;
+    const bool irR = jIrR || (int32_t)(irRightRiseMs - since) >= 0;
+    if (straight) {
+      // A side path next to a straight line must be confirmed by that side's IR.
+      left = left && irL;
+      right = right && irR;
+      if (!left && !right) { Serial.println("Side path not seen by IR: ignored (curve)"); return; }
+    } else if (left && right) {
+      // T needs both IRs; if only one saw a path it was a corner to that side.
+      if (irL && !irR) right = false;
+      else if (irR && !irL) left = false;
+    }
+  }
   uint8_t type;
-  if (jLeft && jRight) type = straight ? JT_CROSS : JT_T;
-  else if (straight) type = jLeft ? JT_LEFT_BRANCH : JT_RIGHT_BRANCH;
-  else type = jLeft ? JT_LEFT_CORNER : JT_RIGHT_CORNER;
+  if (left && right) type = straight ? JT_CROSS : JT_T;
+  else if (straight) type = left ? JT_LEFT_BRANCH : JT_RIGHT_BRANCH;
+  else type = left ? JT_LEFT_CORNER : JT_RIGHT_CORNER;
   reportJunction(type, straight);
 }
 
@@ -1771,7 +1832,7 @@ void startPivot(int8_t dir, uint8_t source) {
 bool edgeTurnRules(const int *cal, int32_t weighted, int32_t total) {
   (void)cal;
   const bool sharpOn = (ruleFlags & RULE_SHARP_TURN) != 0;
-  const bool irOn = (ruleFlags & RULE_IR_TURN) != 0;
+  const bool irOn = (ruleFlags & RULE_IR_TURN) != 0 && (ruleFlags & RULE_JUNCTIONS) == 0;
   const bool leftRose = irLeftRose, rightRose = irRightRose;
   irLeftRose = irRightRose = false;
   if (!sharpOn && !irOn) { pivotDir = 0; return false; }
@@ -1932,10 +1993,13 @@ void loop() {
   updateInversion(calibrated);
   updateLineEvents(calibrated, total);
 
-  if (ruleFlags & RULE_ROUTE) {
-    if (routeStep(calibrated, total)) return;   // route engine drives this cycle
+  const bool routeOn = (ruleFlags & RULE_ROUTE) != 0;
+  const bool junctionsOn = (ruleFlags & RULE_JUNCTIONS) != 0;
+  if (routeOn || (junctionsOn && pivotDir == 0)) {
+    if (routeStep(calibrated, total)) return;   // junction / route engine drives this cycle
     if (!robotOn) return;                       // route finished or stopped
-  } else if (edgeTurnRules(calibrated, weighted, total)) {
+  }
+  if (!routeOn && edgeTurnRules(calibrated, weighted, total)) {
     return;                                     // pivoting this cycle
   }
 
