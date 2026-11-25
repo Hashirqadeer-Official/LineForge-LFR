@@ -87,12 +87,13 @@ public final class MainActivity extends Activity {
             P_LEFT_TRIM = 20, P_RIGHT_TRIM = 21, P_SENSOR_FLIP = 22, P_MOTOR_SWAP = 23,
             P_JUNCTION_IR = 24, P_LINE_WIDTH = 25, P_IR_STABLE = 26, P_LOOKAHEAD = 27,
             P_JUNCTION_PREFER = 28, P_JUNCTION_USE_IR = 29, P_SENSOR_OFF = 30, P_SHARP_USE_IR = 31,
-            P_DEAD_END_ACTION = 32, P_DEAD_END_CONFIRM = 33, P_IR_MEMORY = 34, PARAM_COUNT = 34;
+            P_DEAD_END_ACTION = 32, P_DEAD_END_CONFIRM = 33, P_IR_MEMORY = 34,
+            P_RELATIVE = 35, P_REL_CONTRAST = 36, P_SMOOTH = 37, PARAM_COUNT = 37;
     /** App unit (%, ms) = firmware value x scale. */
     private static final int[] PARAM_SCALE = {1, 10, 100, 1, 1, 1, 100, 1, 1, 1, 1, 10, 10, 10, 10, 100, 1, 100, 100, 1, 1, 1,
-            1, 1, 1, 1, 1, 10, 1, 1, 1, 1, 1, 10, 10};
+            1, 1, 1, 1, 1, 10, 1, 1, 1, 1, 1, 10, 10, 1, 1, 1};
     private static final int[] PARAM_DEFAULT = {0, 50, 15, 0, 0, 35, 15, 1, 0, 0, 6, 10, 5, 25, 15, 30, 2, 5, 10, 0, 100, 100,
-            1, 1, 0, 3, 4, 3, 0, 1, 0, 1, 0, 5, 20};
+            1, 1, 0, 3, 4, 3, 0, 1, 0, 1, 0, 5, 20, 1, 40, 1};
     private static final String[] JUNCTION_NAMES = {"none", "left corner", "right corner",
             "left T (left + straight)", "right T (right + straight)", "T junction", "cross (+)", "box / stop zone"};
     // Route actions shared with the firmware (command 21: action << 4 | seconds).
@@ -1036,6 +1037,25 @@ public final class MainActivity extends Activity {
         line.addView(help("Tap a sensor to switch it OFF if it is broken (e.g. always reads 100). An OFF sensor "
                 + "always counts as white and is ignored by PID, junctions, sharp turns and calibration. "
                 + "S1 = robot's left. The edges then start at the outermost working sensor."));
+        line.addView(txt("Uneven floor", 14, TEXT, true));
+        line.addView(gap(2));
+        line.addView(help("On bumps the sensor height changes: lifted, the black line reads only grey. "
+                + "These two settings keep the line visible."));
+        line.addView(label("Relative black"));
+        line.addView(paramSeg(P_RELATIVE, new String[]{"Off", "On"}).view, full());
+        line.addView(gap(6));
+        line.addView(help("On: every reading is stretched so the lightest sensor = 0 and the darkest = 100. "
+                + "The line stays black even when all sensors read lighter on a bump."));
+        line.addView(gap(12));
+        line.addView(paramStepper(P_REL_CONTRAST, "Minimum contrast",
+                "Stretch only if the darkest sensor is at least this much darker than the lightest. "
+                + "Raise if dirt is seen as a line, lower if the line is lost on bumps.",
+                5, 80, "%", PURPLE).view, full());
+        line.addView(label("Smoothing"));
+        line.addView(paramSeg(P_SMOOTH, new String[]{"Off", "Light", "Medium", "Strong"}).view, full());
+        line.addView(gap(6));
+        line.addView(help("Averages each sensor with its last readings so one bad reading doesn't jerk the "
+                + "robot. Stronger = calmer but reacts a little later (use Light at high speed)."));
         line.addView(label("Line color"));
         line.addView(paramSeg(P_INVERT_MODE, new String[]{"Black line", "Auto", "White line"}).view, full());
         line.addView(gap(6));

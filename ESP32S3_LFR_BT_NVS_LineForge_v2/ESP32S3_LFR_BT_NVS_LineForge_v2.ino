@@ -164,7 +164,10 @@ const uint8_t P_SHARP_USE_IR = 31;      // 1 = side IR detections also tell the 
 const uint8_t P_DEAD_END_ACTION = 32;   // line ends: 0 U-turn, 1 stop, 2 next route step, 3 off
 const uint8_t P_DEAD_END_CONFIRM = 33;  // x10 ms the line must stay gone (drives straight meanwhile)
 const uint8_t P_IR_MEMORY = 34;         // x10 ms: forget an IR side line after the line went on straight this long
-const uint8_t PARAM_COUNT = 34;
+const uint8_t P_RELATIVE = 35;          // 1 = relative black: stretch each reading lightest..darkest
+const uint8_t P_REL_CONTRAST = 36;      // x10: minimum darkest-lightest difference to stretch
+const uint8_t P_SMOOTH = 37;            // 0 off, 1 light, 2 medium, 3 strong
+const uint8_t PARAM_COUNT = 37;
 struct ParamDef { uint8_t minV, maxV, def; };
 const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
   {0, 0, 0},       // 0 unused
@@ -202,6 +205,9 @@ const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
   {0, 3, 0},       // 32 line ends: U-turn
   {1, 50, 5},      // 33 line gone for 50 ms
   {5, 100, 20},    // 34 IR memory 200 ms
+  {0, 1, 1},       // 35 relative black: on
+  {5, 80, 40},     // 36 minimum contrast 40 %
+  {0, 3, 1},       // 37 smoothing: light
 };
 uint8_t params[PARAM_COUNT + 1];
 uint8_t selectedParam = 0;
@@ -878,6 +884,59 @@ void sendCalibrationFrame() {
   sendFramed(PKT_CAL, p, sizeof(p));
 }
 
+// ---------------- Uneven floor: smoothing + relative black ----------------
+// When the floor is not flat the QTR moves up and down: lifted, the black
+// line reads only grey; lowered, white reads darker. Two fixes:
+//  - smoothing: each sensor is averaged with its previous readings, so one
+//    bad reading does not jerk the robot (light = 1/2, medium = 1/3, strong = 1/4);
+//  - relative black: every reading is stretched so the lightest working
+//    sensor becomes 0 and the darkest 1000. The line then stays "black" even
+//    when the whole array reads lighter. Only done when the difference is at
+//    least P_REL_CONTRAST, so plain white floor (only noise) stays white and
+//    an all-dark junction / box stays dark.
+int smoothCal[8] = {0};
+bool smoothReady = false;            // cleared at START
+int lastProcessed[8] = {0};          // what the control loop used (shown in the app)
+int32_t lastProcessedPos = -1;
+
+void applySmoothing(int *v) {
+  const int k = params[P_SMOOTH];
+  if (k == 0 || !smoothReady) {
+    for (int s = 0; s < 8; ++s) smoothCal[s] = v[s];
+    smoothReady = true;
+    return;
+  }
+  for (int s = 0; s < 8; ++s) {
+    smoothCal[s] += (v[s] - smoothCal[s]) / (k + 1);
+    v[s] = smoothCal[s];
+  }
+}
+
+void applyRelative(int *v) {
+  if (!params[P_RELATIVE]) return;
+  int lo = 1000, hi = 0;
+  for (int s = 0; s < 8; ++s) {
+    if (!sensorOn(s)) continue;
+    lo = min(lo, v[s]);
+    hi = max(hi, v[s]);
+  }
+  if (hi - lo < (int)params[P_REL_CONTRAST] * 10) return;
+  for (int s = 0; s < 8; ++s)
+    if (sensorOn(s)) v[s] = (int32_t)(v[s] - lo) * 1000 / (hi - lo);
+}
+
+// Line position from processed values: 0 (S1) .. 7000 (S8).
+void linePosition(const int *v, int32_t &weighted, int32_t &total) {
+  weighted = 0;
+  total = 0;
+  for (int s = 0; s < 8; ++s) {
+    if (v[s] > 250) {
+      weighted += (int32_t)(v[s] - 250) * s;
+      total += v[s] - 250;
+    }
+  }
+}
+
 // Eight calibrated intensities (0 white to 255 black) plus line position.
 // During calibration send raw 12-bit ADC scaled down to 8 bits instead.
 void sendSensorFrameIfDue() {
@@ -890,7 +949,7 @@ void sendSensorFrameIfDue() {
   if ((uint32_t)(now - lastTelemetryMs) < TELEMETRY_PERIOD_MS) return;
   lastTelemetryMs = now;
   uint8_t p[16] = {};
-  long weighted = 0, total = 0;
+  int sig[8] = {0};
   for (int s = 0; s < 8; s++) {
     if (!sensorOn(s)) continue;        // switched off: shown as 0
     const int ch = qtrChannel(s);
@@ -902,12 +961,18 @@ void sendSensorFrameIfDue() {
     else
       signal = raw * 1000L / 4095L;
     if (lineInverted && calOk) signal = 1000 - signal;  // show the line, not the floor
-    p[s] = (uint8_t)((signal * 255L + 500) / 1000);
-    if (calOk && signal > 250) {
-      weighted += (long)(signal - 250) * s;
-      total += (long)(signal - 250);
-    }
+    sig[s] = signal;
   }
+  int32_t weighted = 0, total = 0;
+  if (calOk && !calibrating) {
+    if (robotOn) {
+      for (int s = 0; s < 8; ++s) sig[s] = lastProcessed[s];   // what PID really used
+    } else {
+      applyRelative(sig);
+    }
+    linePosition(sig, weighted, total);
+  }
+  for (int s = 0; s < 8; s++) p[s] = (uint8_t)((sig[s] * 255L + 500) / 1000);
   uint16_t pos = total > 0 ? (uint16_t)(weighted * 1000L / total) : 0xffff;
   p[8] = (uint8_t)(pos & 255); p[9] = (uint8_t)(pos >> 8);
   p[10] = ((total > 0) ? 1 : 0) | (calOk ? 2 : 0) |
@@ -1139,6 +1204,7 @@ void readBluetooth() {
         startPulseActive = START_PULSE_MS > 0;
         if (ruleFlags & RULE_ROUTE) routeReset();
         resetCounters();
+        smoothReady = false;   // smoothing starts fresh
         lineInverted = params[P_INVERT_MODE] == 2;
 
         // Drive both motors immediately, before the first QTR PID sample.
@@ -2134,11 +2200,12 @@ void loop() {
     calibrated[s] = constrain((int32_t)(raw - white[ch]) * 1000 / span,
                               (int32_t)0, (int32_t)1000);
     if (lineInverted) calibrated[s] = 1000 - calibrated[s];  // white line on black
-    if (calibrated[s] > 250) {
-      weighted += (int32_t)(calibrated[s] - 250) * s;
-      total += calibrated[s] - 250;
-    }
   }
+  applySmoothing(calibrated);   // uneven floor: average bad readings out
+  applyRelative(calibrated);    // uneven floor: line darker than the rest = black
+  linePosition(calibrated, weighted, total);
+  for (int s = 0; s < 8; ++s) lastProcessed[s] = calibrated[s];
+  lastProcessedPos = total > 0 ? weighted * 1000 / total : -1;
 
   updateInversion(calibrated);
   updateLineEvents(calibrated, total);
