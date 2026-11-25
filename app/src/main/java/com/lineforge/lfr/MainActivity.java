@@ -77,7 +77,7 @@ public final class MainActivity extends Activity {
     private static final int TAB_CALIBRATE = 2, TAB_LOG = 4;
     // Option bits shared with the firmware (command 17).
     private static final int RULE_SHARP_TURN = 0x01, RULE_KEEP_OLD_CAL = 0x02, RULE_ROUTE = 0x04,
-            RULE_IR_TURN = 0x08, RULE_JUNCTIONS = 0x10;
+            RULE_IR_TURN = 0x08;
     // Rule settings shared with the firmware (commands 23/24, frame type 0x54).
     private static final int P_LINE_THRESHOLD = 1, P_SHARP_TIMEOUT = 2, P_SHARP_END = 3,
             P_IR_TRIGGER = 4, P_IR_SPEED = 5, P_IR_TIMEOUT = 6, P_IR_END = 7, P_IR_DEBOUNCE = 8,
@@ -86,14 +86,15 @@ public final class MainActivity extends Activity {
             P_EDGE_ZONE = 17, P_SHARP_STOP = 18, P_IR_END_SENSOR = 19,
             P_LEFT_TRIM = 20, P_RIGHT_TRIM = 21, P_SENSOR_FLIP = 22, P_MOTOR_SWAP = 23,
             P_JUNCTION_IR = 24, P_LINE_WIDTH = 25, P_IR_STABLE = 26, P_LOOKAHEAD = 27,
-            P_JUNCTION_PREFER = 28, P_JUNCTION_USE_IR = 29, PARAM_COUNT = 29;
+            P_JUNCTION_PREFER = 28, P_JUNCTION_USE_IR = 29, P_SENSOR_OFF = 30, P_SHARP_USE_IR = 31,
+            P_DEAD_END_ACTION = 32, P_DEAD_END_CONFIRM = 33, PARAM_COUNT = 33;
     /** App unit (%, ms) = firmware value x scale. */
     private static final int[] PARAM_SCALE = {1, 10, 100, 1, 1, 1, 100, 1, 1, 1, 1, 10, 10, 10, 10, 100, 1, 100, 100, 1, 1, 1,
-            1, 1, 1, 1, 1, 10, 1, 1};
+            1, 1, 1, 1, 1, 10, 1, 1, 1, 1, 1, 10};
     private static final int[] PARAM_DEFAULT = {0, 50, 15, 0, 0, 35, 15, 1, 0, 0, 6, 10, 5, 25, 15, 30, 2, 5, 10, 0, 100, 100,
-            1, 1, 0, 3, 4, 3, 0, 1};
+            1, 1, 0, 3, 4, 3, 0, 1, 0, 0, 0, 5};
     private static final String[] JUNCTION_NAMES = {"none", "left corner", "right corner",
-            "left branch + straight", "right branch + straight", "T junction", "cross (+)", "box / stop zone"};
+            "left T (left + straight)", "right T (right + straight)", "T junction", "cross (+)", "box / stop zone"};
     // Route actions shared with the firmware (command 21: action << 4 | seconds).
     private static final int ACT_LEFT = 1, ACT_RIGHT = 2, ACT_STRAIGHT = 3, ACT_UTURN = 4,
             ACT_WAIT_BLUE = 5, ACT_WAIT_GREEN = 6, ACT_FINISH = 7;
@@ -146,7 +147,10 @@ public final class MainActivity extends Activity {
     private Button calStartButton;
     private boolean calibrating = false;
     // Rules + saved-calibration options
-    private Toggle sharpTurnSwitch, keepOldCalSwitch, irTurnSwitch, junctionSwitch;
+    private Toggle sharpTurnSwitch, keepOldCalSwitch, irTurnSwitch;
+    private final TextView[] sensorChips = new TextView[8];
+    private TextView ruleNowLabel, ruleMemoryLabel;
+    private int lastActivity = -1, lastMemory = 0;
     private final Stepper[] paramSteppers = new Stepper[PARAM_COUNT + 1];
     private final Segmented[] paramSegs = new Segmented[PARAM_COUNT + 1];
     private LinearLayout invertOptions;
@@ -849,6 +853,7 @@ public final class MainActivity extends Activity {
         if (paramSteppers[id] != null) paramSteppers[id].set(fwValue * PARAM_SCALE[id]);
         if (connected) sendBytes(new byte[]{23, (byte)id, 24, (byte)fwValue}, false);
         if (id == P_INVERT_MODE) updateInvertUi();
+        if (id == P_SENSOR_OFF) updateSensorChips();
     }
 
     private void sendAllParams() {
@@ -872,6 +877,72 @@ public final class MainActivity extends Activity {
         }
         e.apply();
         updateInvertUi();
+        updateSensorChips();
+    }
+
+    private void toggleSensor(int bit) {
+        int mask = paramValue(P_SENSOR_OFF) ^ (1 << bit);
+        if (Integer.bitCount(mask) > 5) { showToast("At least 3 sensors must stay ON"); return; }
+        setParam(P_SENSOR_OFF, mask);
+        boolean off = (mask & (1 << bit)) != 0;
+        addEvent("Sensor S" + (bit + 1) + (off ? " switched OFF: it is ignored from now on." : " switched ON again."));
+    }
+
+    private void updateSensorChips() {
+        int mask = paramValue(P_SENSOR_OFF);
+        for (int i = 0; i < 8; i++) {
+            TextView c = sensorChips[i];
+            if (c == null) continue;
+            boolean off = (mask & (1 << i)) != 0;
+            c.setText(off ? "S" + (i + 1) + "\nOFF" : "S" + (i + 1));
+            c.setTextSize(off ? 10 : 13);
+            c.setTextColor(off ? RED : BG);
+            c.setBackground(rounded(off ? PANEL_ALT : MINT, 10, off ? RED : 0));
+        }
+        if (sensorView != null) sensorView.setOffMask(mask);
+    }
+
+    private static final String[] ACTIVITY = {
+            "Stopped",
+            "Sharp turn: spinning LEFT until the QTR sees the line near the center",
+            "Sharp turn: spinning RIGHT until the QTR sees the line near the center",
+            "IR turn: turning LEFT until the IR sees the line again",
+            "IR turn: turning RIGHT until the IR sees the line again",
+            "Turning LEFT (junction step or corner)",
+            "Turning RIGHT (junction step, corner or U-turn)",
+            "Crossing a junction (driving straight to see what it is)",
+            "Route: waiting in a box",
+            "Following the line (PID)",
+            "Line disappeared: driving straight to check if it ended"};
+
+    private String memoryText(int m) {
+        StringBuilder b = new StringBuilder();
+        if ((m & 1) != 0) b.append("Sharp turn → spin LEFT (QTR saw the line at the left edge). ");
+        else if ((m & 2) != 0) b.append("Sharp turn → spin RIGHT (QTR saw the line at the right edge). ");
+        else if ((m & 16) != 0) b.append("Sharp turn → spin LEFT (IR-L saw a side line). ");
+        else if ((m & 32) != 0) b.append("Sharp turn → spin RIGHT (IR-R saw a side line). ");
+        if ((m & 4) != 0) b.append("IR turn → turn LEFT (IR-L saw the line).");
+        else if ((m & 8) != 0) b.append("IR turn → turn RIGHT (IR-R saw the line).");
+        return b.length() == 0 ? "nothing remembered → PID searches toward the side it saw last" : b.toString().trim();
+    }
+
+    private void showActivity(int act, int mem) {
+        if (act >= ACTIVITY.length) return;
+        if (ruleNowLabel != null) {
+            ruleNowLabel.setText("Now: " + ACTIVITY[act]);
+            ruleNowLabel.setTextColor(act == 0 ? MUTED : act == 9 ? MINT : ORANGE);
+        }
+        if (ruleMemoryLabel != null)
+            ruleMemoryLabel.setText("If the line is lost now: " + (act == 0 ? "—" : memoryText(mem)));
+        if (act != lastActivity && lastActivity >= 0) {
+            if (act >= 1 && act <= 4)
+                addEvent("▶ " + ACTIVITY[act] + ". Why: " + memoryText(lastMemory) + " and then the line was lost"
+                        + (act >= 3 ? " (or the IR started it immediately)." : "."));
+            else if (act == 9 && lastActivity >= 1 && lastActivity <= 4)
+                addEvent("✓ Turn finished: line found, PID continues.");
+        }
+        lastActivity = act;
+        lastMemory = mem;
     }
 
     private void updateInvertUi() {
@@ -921,28 +992,17 @@ public final class MainActivity extends Activity {
         intro.addView(gap(6));
         intro.addView(help("Tap ON or OFF to switch a rule; its settings are right below it. "
                 + "Changes are sent to the robot immediately and kept after power-off."));
+        intro.addView(gap(12));
+        intro.addView(txt("Live", 13, TEXT, true));
+        ruleNowLabel = txt("Now: waiting for robot…", 13, MUTED, true);
+        intro.addView(ruleNowLabel, full());
+        ruleMemoryLabel = help("If the line is lost now: —");
+        intro.addView(ruleMemoryLabel, full());
+        intro.addView(gap(4));
+        intro.addView(help("Every turn a rule starts and ends is also written in the Log."));
         content.addView(intro, full());
         content.addView(gap(12));
         int flags = preferences.getInt("rule_flags", RULE_KEEP_OLD_CAL);
-
-        // Robot wiring: makes left = the robot's real left everywhere
-        LinearLayout wiring = card();
-        wiring.addView(cardHeader("Robot wiring", "left must mean the robot's left"));
-        wiring.addView(gap(6));
-        wiring.addView(help("Check 1: put the line under the robot's LEFT-most sensor. The position on the "
-                + "Drive tab (live sensors) must be near 0. If it shows ~7000, change Sensor order."));
-        wiring.addView(label("Sensor order"));
-        wiring.addView(paramSeg(P_SENSOR_FLIP, new String[]{"Normal", "Reversed"}).view, full());
-        wiring.addView(gap(10));
-        wiring.addView(help("Check 2: set Left motor to 60% (Drive tab → Wheel balance) and press Drive straight. "
-                + "The robot's LEFT wheel must be the slow one. If the right wheel is slow, change Motor channels."));
-        wiring.addView(label("Motor channels"));
-        wiring.addView(paramSeg(P_MOTOR_SWAP, new String[]{"Normal", "Swapped"}).view, full());
-        wiring.addView(gap(6));
-        wiring.addView(help("Always change both together if PID was already working: changing only one makes "
-                + "the robot steer away from the line."));
-        content.addView(wiring, full());
-        content.addView(gap(12));
 
         // Line sensors: threshold + inverted line (white line on black)
         LinearLayout line = card();
@@ -950,6 +1010,23 @@ public final class MainActivity extends Activity {
         line.addView(gap(12));
         line.addView(paramStepper(P_LINE_THRESHOLD, "Black threshold",
                 "How dark a sensor must read to count as the line", 10, 100, "%", MINT).view, full());
+        line.addView(label("Sensors in use"));
+        LinearLayout chips = row();
+        for (int i = 0; i < 8; i++) {
+            final int bit = i;
+            TextView chip = txt("S" + (i + 1), 13, TEXT, true);
+            chip.setGravity(Gravity.CENTER);
+            chip.setOnClickListener(v -> toggleSensor(bit));
+            sensorChips[i] = chip;
+            if (i > 0) chips.addView(hgap(4));
+            chips.addView(chip, new LinearLayout.LayoutParams(0, dp(40), 1f));
+        }
+        line.addView(chips, full());
+        updateSensorChips();
+        line.addView(gap(6));
+        line.addView(help("Tap a sensor to switch it OFF if it is broken (e.g. always reads 100). An OFF sensor "
+                + "always counts as white and is ignored by PID, junctions, sharp turns and calibration. "
+                + "S1 = robot's left. The edges then start at the outermost working sensor."));
         line.addView(label("Line color"));
         line.addView(paramSeg(P_INVERT_MODE, new String[]{"Black line", "Auto", "White line"}).view, full());
         line.addView(gap(6));
@@ -967,42 +1044,6 @@ public final class MainActivity extends Activity {
         content.addView(line, full());
         content.addView(gap(12));
 
-        // Junctions: detection (QTR + IR) and the robot's own choice when route is off
-        LinearLayout junc = card();
-        junctionSwitch = optionSwitch("Decide at junctions", "Route OFF: robot picks the path itself",
-                (flags & RULE_JUNCTIONS) != 0, junc);
-        junc.addView(gap(8));
-        junc.addView(help("Right path = S7 + S8 dark together with the center (S4/S5), and IR-R sees the line. "
-                + "Left path mirrors it. After the side sensors are white again the robot drives on a few mm "
-                + "(look-ahead) and checks the center: line still there = junction (branch / cross), "
-                + "line ended = 90° corner (or T when both sides had a path). Corners are always turned."));
-        junc.addView(gap(6));
-        junc.addView(help("Competition route ON: at every junction the next route step decides (this switch is "
-                + "not needed). Route OFF and this switch ON: the choice below decides. While this switch is ON "
-                + "the IR turn rule is not used: the IR sensors help detect junctions instead."));
-        junc.addView(label("At a choice, go"));
-        junc.addView(paramSeg(P_JUNCTION_PREFER,
-                new String[]{"Straight, else L", "Straight, else R", "Left first", "Right first"}).view, full());
-        junc.addView(gap(6));
-        junc.addView(help("Straight, else L: branch → straight, T → left.  Left first: left whenever there is a "
-                + "left path, else straight, else right.  (Right options mirror it.)"));
-        junc.addView(label("Side IR must also see a side path"));
-        junc.addView(paramSeg(P_JUNCTION_USE_IR, new String[]{"Off (QTR only)", "On (QTR + IR)"}).view, full());
-        junc.addView(gap(6));
-        junc.addView(help("On: when there is a straight path too, a side path only counts if that side's IR saw the "
-                + "line, so curves are never junctions. A plain corner (line ends) is turned even without IR."));
-        junc.addView(gap(12));
-        junc.addView(paramStepper(P_LOOKAHEAD, "Look-ahead",
-                "Drive on this long after the side path before checking if the line goes on. "
-                + "Raise if corners are mistaken for junctions, lower if the robot overshoots.",
-                0, 30, "ms", MINT).view, full());
-        junc.addView(gap(12));
-        junc.addView(paramStepper(P_JUNCTION_CONFIRM, "Confirm readings",
-                "The pattern must be seen this many readings in a row (1 reading = 5 ms). Raise if noise "
-                + "gives false junctions, lower if junctions are missed.", 1, 10, "", BLUE).view, full());
-        content.addView(junc, full());
-        content.addView(gap(12));
-
         // Sharp turn recovery (QTR outer sensors)
         LinearLayout sharp = card();
         sharpTurnSwitch = optionSwitch("Sharp turn recovery", "QTR line position • 90° turns at speed",
@@ -1012,6 +1053,12 @@ public final class MainActivity extends Activity {
                 + "If the line was in the left edge zone and then the robot loses it → spin left in place "
                 + "(right motor forward, left backward) until the line is back near the center, then PID continues. "
                 + "The right edge mirrors it."));
+        sharp.addView(label("Use IR to detect side lines"));
+        sharp.addView(paramSeg(P_SHARP_USE_IR, new String[]{"Off (QTR only)", "On (QTR + IR)"}).view, full());
+        sharp.addView(gap(6));
+        sharp.addView(help("On: when a side IR sees a line (a turn is coming on that side), the robot remembers "
+                + "that side too. If the line is then lost it spins that way. The QTR edge has priority, and "
+                + "the spin ALWAYS ends with the QTR (line back near the center), never with the IR."));
         sharp.addView(gap(12));
         pivotSpeedStep = new Stepper("Spin speed", "Motor power while turning in place", 10, 100,
                 preferences.getInt("pivot_speed", 35), "%", MINT, true);
@@ -1040,9 +1087,13 @@ public final class MainActivity extends Activity {
         irLiveLabel = txt("IR-L  ○      IR-R  ○", 13, MUTED, true);
         ir.addView(irLiveLabel, full());
         ir.addView(gap(6));
-        ir.addView(help("IR-R detects → turn right with both wheels (left forward, right backward). The moment the "
-                + "IR detects the line again, PID takes over. IR-L mirrors it. Detections are always counted "
-                + "on the Drive tab."));
+        ir.addView(help("How it works (right side, left mirrors it):\n"
+                + "1. IR-R sees a line → the robot remembers \"turn right\".\n"
+                + "2. Start turning: when the QTR loses the line, or immediately (setting below).\n"
+                + "3. Turns right with both wheels (left forward, right backward).\n"
+                + "4. The moment the IR sees the line again, PID takes over.\n"
+                + "If Sharp turn recovery is also ON and the QTR saw the line at an edge, the sharp turn "
+                + "goes first. Detections are always counted on the Drive tab."));
         ir.addView(gap(12));
         ir.addView(paramStepper(P_IR_STABLE, "Stable time",
                 "The IR must stay black this long to count (and white as long before the next one). "
@@ -1057,6 +1108,26 @@ public final class MainActivity extends Activity {
         content.addView(ir, full());
         content.addView(gap(12));
 
+        // Line ends (dead end)
+        LinearLayout dead = card();
+        dead.addView(cardHeader("When the line ends", "dead end"));
+        dead.addView(gap(6));
+        dead.addView(help("The line disappears while it was in the middle (not at an edge — that is a turn). "
+                + "The robot first drives straight for the time below, so a small gap is crossed. If the line "
+                + "is still gone, it does what you pick here."));
+        dead.addView(label("Then"));
+        dead.addView(paramSeg(P_DEAD_END_ACTION, new String[]{"U-turn", "Stop", "Route step", "Off"}).view, full());
+        dead.addView(gap(6));
+        dead.addView(help("U-turn: back up a little and spin until the line is found (default). "
+                + "Stop: the robot stops. Route step: run the next Competition route step (route ON only, "
+                + "otherwise U-turn). Off: search like before."));
+        dead.addView(gap(12));
+        dead.addView(paramStepper(P_DEAD_END_CONFIRM, "Line gone for",
+                "Drive straight this long before deciding the line really ended. Raise it if the track "
+                + "has gaps.", 1, 50, "ms", BLUE).view, full());
+        content.addView(dead, full());
+        content.addView(gap(12));
+
         content.addView(buildRouteCard(flags), full());
         return content;
     }
@@ -1068,8 +1139,9 @@ public final class MainActivity extends Activity {
         routeSwitch = optionSwitch("Competition route", "Fire Rescue: follow the programmed steps",
                 (flags & RULE_ROUTE) != 0, c);
         c.addView(gap(10));
-        c.addView(help("At every junction (branch, T, cross) or box the robot carries out the next step below. "
-                + "Curves and plain 90° corners (only one way to go) are followed automatically and don't use a step. "
+        c.addView(help("Steps are used ONLY at junctions: T, left T (left + straight), right T (right + straight) "
+                + "and cross, plus boxes (for the waits). 90° corners and curves are turned by themselves and "
+                + "never use a step. When the line ends: see the card above. "
                 + "Start the robot inside the Start box. While route mode is on, sharp turn recovery is not used."));
         c.addView(gap(16));
 
@@ -1108,7 +1180,7 @@ public final class MainActivity extends Activity {
         head.addView(routeSummary);
         c.addView(head, full());
         c.addView(gap(4));
-        c.addView(help("Tap a step to change it, long-press to delete it."));
+        c.addView(help("Tap a step to change it, ✕ to delete it."));
         c.addView(gap(8));
         routeListView = col();
         c.addView(routeListView, full());
@@ -1138,6 +1210,25 @@ public final class MainActivity extends Activity {
         routeAdv.addView(gap(12));
         routeAdv.addView(paramStepper(P_TURN_TIMEOUT, "Turn gives up after",
                 "Stop the run if a turn never finds the line", 5, 100, "ms", ORANGE).view, full());
+        routeAdv.addView(gap(16));
+        routeAdv.addView(txt("Junction detection", 14, TEXT, true));
+        routeAdv.addView(gap(4));
+        routeAdv.addView(help("Right path = the two right-most QTR sensors dark together with the center (S4/S5); "
+                + "left mirrors it. After the side is white again the robot drives on a little (look-ahead) and "
+                + "checks the center: line still there = junction (branch / cross), line ended = corner "
+                + "(or T when both sides had a path). Corners are turned by themselves; junctions use the next step."));
+        routeAdv.addView(label("Side IR must also see a side path"));
+        routeAdv.addView(paramSeg(P_JUNCTION_USE_IR, new String[]{"Off (QTR only)", "On (QTR + IR)"}).view, full());
+        routeAdv.addView(gap(6));
+        routeAdv.addView(help("On: next to a straight line, a side path only counts if that side's IR saw it, "
+                + "so curves are never junctions."));
+        routeAdv.addView(gap(12));
+        routeAdv.addView(paramStepper(P_LOOKAHEAD, "Look-ahead",
+                "Drive on this long after a side path before checking if the line goes on",
+                0, 30, "ms", MINT).view, full());
+        routeAdv.addView(gap(12));
+        routeAdv.addView(paramStepper(P_JUNCTION_CONFIRM, "Confirm readings",
+                "Pattern must be seen this many readings in a row (1 reading = 5 ms)", 1, 10, "", BLUE).view, full());
         c.addView(gap(10));
         turnDelayStep = new Stepper("Turn delay", "Drive forward before turning, so the wheels reach the junction",
                 0, 500, preferences.getInt("turn_delay", 100), "ms", PURPLE, false);
@@ -1230,6 +1321,19 @@ public final class MainActivity extends Activity {
             String note = routeNotes.get(i);
             if (!note.isEmpty()) texts.addView(txt(note, 11, MUTED, false));
             item.addView(texts, weighted());
+            TextView del = txt("✕", 16, RED, true);
+            del.setGravity(Gravity.CENTER);
+            del.setBackground(rounded(PANEL_ALT, 100, 0));
+            del.setOnClickListener(v -> new AlertDialog.Builder(this)
+                    .setTitle("Delete step " + (index + 1) + "?")
+                    .setMessage(actionLabel(st[0], st[1]))
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Delete", (d, w) -> {
+                        routeSteps.remove(index); routeNotes.remove(index);
+                        saveRouteLocal(); renderRoute();
+                        showToast("Step deleted. Send the route to the robot again.");
+                    }).show());
+            item.addView(del, new LinearLayout.LayoutParams(dp(34), dp(34)));
             item.setOnClickListener(v -> editRouteStep(index));
             item.setOnLongClickListener(v -> {
                 new AlertDialog.Builder(this).setTitle("Delete step " + (index + 1) + "?")
@@ -1366,7 +1470,6 @@ public final class MainActivity extends Activity {
         if (keepOldCalSwitch != null && keepOldCalSwitch.isChecked()) f |= RULE_KEEP_OLD_CAL;
         if (routeSwitch != null && routeSwitch.isChecked()) f |= RULE_ROUTE;
         if (irTurnSwitch != null && irTurnSwitch.isChecked()) f |= RULE_IR_TURN;
-        if (junctionSwitch != null && junctionSwitch.isChecked()) f |= RULE_JUNCTIONS;
         return f;
     }
 
@@ -1381,8 +1484,7 @@ public final class MainActivity extends Activity {
         if (log) addEvent("Rules sent: sharp turn " + (sharpTurnSwitch.isChecked() ? "ON" : "OFF")
                 + " (spin " + pivotSpeedStep.get() + "%), keep previous calibration "
                 + (keepOldCalSwitch.isChecked() ? "ON" : "OFF") + ", IR turn "
-                + (irTurnSwitch != null && irTurnSwitch.isChecked() ? "ON" : "OFF") + ", junction decisions "
-                + (junctionSwitch != null && junctionSwitch.isChecked() ? "ON" : "OFF") + ", route mode "
+                + (irTurnSwitch != null && irTurnSwitch.isChecked() ? "ON" : "OFF") + ", route mode "
                 + (routeSwitch != null && routeSwitch.isChecked() ? "ON" : "OFF") + ".");
     }
 
@@ -1393,7 +1495,6 @@ public final class MainActivity extends Activity {
         keepOldCalSwitch.setChecked((flags & RULE_KEEP_OLD_CAL) != 0);
         if (routeSwitch != null) routeSwitch.setChecked((flags & RULE_ROUTE) != 0);
         if (irTurnSwitch != null) irTurnSwitch.setChecked((flags & RULE_IR_TURN) != 0);
-        if (junctionSwitch != null) junctionSwitch.setChecked((flags & RULE_JUNCTIONS) != 0);
         bindingRules = false;
         if (pivot >= 10 && pivot <= 100) pivotSpeedStep.set(pivot);
         saveRuleOptions();
@@ -2237,6 +2338,12 @@ public final class MainActivity extends Activity {
             showToast("Route complete");
             return;
         }
+        if (b == 0xE2) {
+            running = false; startPending = false; updateRunUI();
+            addEvent("Stopped: the line ended (dead end). Change this in Rules → When the line ends.");
+            showToast("Line ended: robot stopped");
+            return;
+        }
         if (b == 0xE0) {
             running = false; startPending = false; updateRunUI();
             addEvent("Route stopped: a turn did not find the line. Check the steps and the turn delay.");
@@ -2277,6 +2384,7 @@ public final class MainActivity extends Activity {
                     (payload[2] & 255) | ((payload[3] & 255) << 8),
                     payload[4] & 255, payload[5] & 255, payload[6] & 255, payload[7] & 255};
             for (int i = 0; i < 6; i++) counterViews[i].setText(String.valueOf(v[i]));
+            if (payload.length >= 14) showActivity(payload[12] & 255, payload[13] & 255);
             if (payload.length >= 12) {
                 int jt = payload[10] & 255, seq = payload[11] & 255;
                 if (lastJunctionSeq >= 0 && seq != lastJunctionSeq && jt > 0 && jt < JUNCTION_NAMES.length)
@@ -2302,6 +2410,16 @@ public final class MainActivity extends Activity {
                 b.append(String.format(Locale.US, "S%d   white %4d   black %4d   span %4d\n",i+1,w,black,span));
             }
             calibrationInfo.setText("NVS calibration received • minimum range " + minRange + " ADC counts");
+            StringBuilder weak = new StringBuilder();
+            int off = paramValue(P_SENSOR_OFF);
+            for (int i = 0; i < 8; i++) {
+                int w = (payload[4*i] & 255) | ((payload[4*i+1] & 255) << 8);
+                int bk = (payload[4*i+2] & 255) | ((payload[4*i+3] & 255) << 8);
+                if ((off & (1 << i)) == 0 && bk - w < 300) weak.append(weak.length() == 0 ? "" : ", ").append("S").append(i + 1);
+            }
+            if (weak.length() > 0)
+                addEvent("⚠ " + weak + " hardly changed between white and black: it may be broken or dirty. "
+                        + "Clean it, or switch it OFF in Rules → Line sensors → Sensors in use.");
             if (calibrationDialogPending) {
                 calibrationDialogPending = false;
                 new AlertDialog.Builder(this).setTitle("QTR-8A saved calibration")

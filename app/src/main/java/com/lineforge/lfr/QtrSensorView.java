@@ -33,7 +33,9 @@ public final class QtrSensorView extends View {
         int h = (int)dp(232);
         setMeasuredDimension(resolveSize((int)dp(270), widthMeasureSpec), resolveSize(h, heightMeasureSpec));
     }
+    private int offMask = 0;            // bit i = sensor S(i+1) switched off
     public void setConnected(boolean b) { online = b; invalidate(); }
+    public void setOffMask(int mask) { offMask = mask; invalidate(); }
     public void update(int[] normalized, int position1000, boolean seesLine, boolean calibrating) {
         for (int i = 0; i < 8; i++) target[i] = Math.min(1f, Math.max(0f, normalized[i]/255f));
         if (position1000 >= 0 && position1000 <= 7000) targetPosition = position1000/1000f;
@@ -79,13 +81,19 @@ public final class QtrSensorView extends View {
             float diff=target[i]-shown[i];
             shown[i] += diff*0.24f;
             float top=chartBot-chartHeight*shown[i];
-            if (shown[i]>0.01f) {
+            final boolean off = (offMask & (1 << i)) != 0;
+            if (off) {
+                brush.setColor(Color.rgb(255,98,111));
+                brush.setTextSize(dp(10));
+                brush.setTypeface(android.graphics.Typeface.create("sans-serif-medium",1));
+                canvas.drawText("OFF", x + (cell-brush.measureText("OFF"))/2, (chartTop+chartBot)/2, brush);
+            } else if (shown[i]>0.01f) {
                 int color = (shown[i] >= 0.25f) ? mint : Color.rgb(74,113,134);
                 rounded(canvas,x,top,x+cell,chartBot,dp(9),color);
             }
             brush.setTextSize(dp(11));
             brush.setTypeface(android.graphics.Typeface.create("sans-serif-medium",1));
-            brush.setColor(fg);
+            brush.setColor(off ? dim : fg);
             String n="S"+(i+1);
             canvas.drawText(n, x + (cell-brush.measureText(n))/2,dp(186),brush);
             brush.setTypeface(android.graphics.Typeface.create("sans-serif",0));

@@ -55,7 +55,7 @@
     [26,0] send all settings (frame type 54)      [27,0] reset counters
     [28,s] wheel-balance test: drive straight at base speed for s seconds (1..10), no PID
     Type 54: settings, one byte per setting id 1..PARAM_COUNT.
-    Type 55: counters (12 bytes): IR-L count u16, IR-R count u16, junctions, left turns,
+    Type 55: counters (14 bytes): IR-L count u16, IR-R count u16, junctions, left turns,
              right turns, gaps, flags (bit0 IR-L sees black, bit1 IR-R,
              bit2 line inverted), inversions.
     [18,value] Sharp-turn spin speed % (10..100)
@@ -97,6 +97,7 @@ struct SpeedRecord;
 struct RuleRecord;
 struct RouteRecord;
 struct ParamRecord;
+struct ParamRecordOld;
 struct IrFilter;
 
 // ---------------- User options ----------------
@@ -156,9 +157,13 @@ const uint8_t P_JUNCTION_IR = 24;       // (unused: junctions use the QTR only)
 const uint8_t P_LINE_WIDTH = 25;        // (unused)
 const uint8_t P_IR_STABLE = 26;         // ms an IR must stay black (and white) to count: kills flicker
 const uint8_t P_LOOKAHEAD = 27;         // x10 ms: drive on after a side path before looking ahead
-const uint8_t P_JUNCTION_PREFER = 28;   // route OFF: 0 straight>left, 1 straight>right, 2 left first, 3 right first
+const uint8_t P_JUNCTION_PREFER = 28;   // (unused)
 const uint8_t P_JUNCTION_USE_IR = 29;   // 1 = side IR must also see a side path (when there is a choice)
-const uint8_t PARAM_COUNT = 29;
+const uint8_t P_SENSOR_OFF = 30;        // bit s = QTR sensor S(s+1) switched off (broken), S1 = robot's left
+const uint8_t P_SHARP_USE_IR = 31;      // 1 = side IR detections also tell the sharp turn which side the line went
+const uint8_t P_DEAD_END_ACTION = 32;   // line ends: 0 U-turn, 1 stop, 2 next route step, 3 off
+const uint8_t P_DEAD_END_CONFIRM = 33;  // x10 ms the line must stay gone (drives straight meanwhile)
+const uint8_t PARAM_COUNT = 33;
 struct ParamDef { uint8_t minV, maxV, def; };
 const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
   {0, 0, 0},       // 0 unused
@@ -191,6 +196,10 @@ const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
   {0, 30, 3},      // 27 look-ahead 30 ms
   {0, 3, 0},       // 28 route OFF choice: straight, else left
   {0, 1, 1},       // 29 IR confirms side paths: on
+  {0, 255, 0},     // 30 sensors switched off: none
+  {0, 1, 0},       // 31 sharp turn uses IR: off
+  {0, 3, 0},       // 32 line ends: U-turn
+  {1, 50, 5},      // 33 line gone for 50 ms
 };
 uint8_t params[PARAM_COUNT + 1];
 uint8_t selectedParam = 0;
@@ -366,7 +375,6 @@ int8_t lastEdge = 0;                    // -1 = S1 (left) saw line last, +1 = S8
 int8_t pivotDir = 0;                    // 0 = not pivoting, -1 left, +1 right
 uint32_t pivotStartMs = 0;
 const uint8_t RULE_IR_TURN = 0x08;
-const uint8_t RULE_JUNCTIONS = 0x10;    // route OFF: decide at junctions by P_JUNCTION_PREFER
 const uint8_t SRC_SHARP = 0, SRC_IR = 1;
 uint8_t pivotSource = SRC_SHARP;         // which rule started the current spin
 uint32_t straightTestEndMs = 0;         // wheel-balance test running until this time (0 = off)
@@ -382,6 +390,9 @@ struct IrFilter { bool state; bool raw; uint32_t sinceUs; };
 IrFilter irFiltL = {false, false, 0}, irFiltR = {false, false, 0};
 uint32_t irLeftRiseMs = 0, irRightRiseMs = 0;     // when each IR last counted a detection
 int8_t irEdge = 0;                     // -1 = IR-L saw the line last, +1 = IR-R
+int8_t sharpIrEdge = 0;                // sharp turn + IR option: side where an IR saw a line
+uint8_t sharpIrClear = 0;              // centered readings since that IR went white
+const uint8_t SHARP_IR_FORGET = 20;    // forget it after 20 centered readings (100 ms)
 
 // ---- Inverted line (white line on black) ----
 bool lineInverted = false;
@@ -426,7 +437,11 @@ const uint32_t JUNCTION_TIMEOUT_MS = 1500;   // safety: a junction shape never l
 const uint32_t REVERSE_MS = 250;        // back out of a box before a U-turn
 const uint32_t TURN_LEAVE_MIN_MS = 80;
 const uint32_t UTURN_LEAVE_MIN_MS = 300;
-const uint8_t ROUTE_FINISHED = 0xE1, ROUTE_FAILED = 0xE0;
+const uint8_t ROUTE_FINISHED = 0xE1, ROUTE_FAILED = 0xE0, LINE_ENDED_STOP = 0xE2;
+// Dead end: the line disappears while it was near the center.
+bool deadEndArmed = false, deadEndChecking = false;
+uint32_t deadEndArmMs = 0, deadEndLostMs = 0;
+int32_t lastLinePos = 3500;
 const uint8_t RS_FOLLOW = 0, RS_JUNCTION = 1, RS_TURN_FWD = 2, RS_TURN_LEAVE = 3,
               RS_TURN_FIND = 4, RS_REVERSE = 5, RS_WAIT = 6;
 uint8_t route[MAX_ROUTE_STEPS];
@@ -489,13 +504,24 @@ struct PIDRecord {
   uint32_t checksum;
 };
 
+// Settings record. Old firmware saved 32 values; it is still read once
+// (key "prm"), new saves use 64 values under key "prm64".
+const int PARAM_SLOTS = 64;
 struct ParamRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint8_t count, reserved;
+  uint8_t values[PARAM_SLOTS];
+  uint32_t checksum;
+};
+struct ParamRecordOld {
   uint32_t magic;
   uint16_t version;
   uint8_t count, reserved;
   uint8_t values[32];
   uint32_t checksum;
 };
+static_assert(PARAM_COUNT < PARAM_SLOTS, "too many settings for the NVS record");
 
 struct RouteRecord {
   uint32_t magic;
@@ -608,19 +634,36 @@ void defaultParams() {
   for (int i = 0; i <= PARAM_COUNT; ++i) params[i] = PARAM_DEFS[i].def;
 }
 
-bool loadParams() {
-  defaultParams();
-  if (!prefsReady || prefs.getBytesLength("prm") != sizeof(ParamRecord)) return false;
-  ParamRecord r = {};
-  if (prefs.getBytes("prm", &r, sizeof(r)) != sizeof(r)) return false;
-  if (r.magic != PRM_MAGIC || r.version != STORAGE_VERSION) return false;
-  if (r.checksum != checksum32(&r, offsetof(ParamRecord, checksum))) return false;
-  // Settings added in a newer firmware keep their defaults.
-  for (int i = 1; i <= PARAM_COUNT && i <= r.count; ++i) {
-    uint8_t v = r.values[i];
+// Copies stored values; settings added in a newer firmware keep their defaults.
+void applyStoredParams(const uint8_t *values, int count, int slots) {
+  for (int i = 1; i <= PARAM_COUNT && i <= count && i < slots; ++i) {
+    uint8_t v = values[i];
     if (v >= PARAM_DEFS[i].minV && v <= PARAM_DEFS[i].maxV) params[i] = v;
   }
-  return true;
+}
+
+bool loadParams() {
+  defaultParams();
+  if (!prefsReady) return false;
+  if (prefs.getBytesLength("prm64") == sizeof(ParamRecord)) {
+    ParamRecord r = {};
+    if (prefs.getBytes("prm64", &r, sizeof(r)) == sizeof(r) && r.magic == PRM_MAGIC &&
+        r.version == STORAGE_VERSION &&
+        r.checksum == checksum32(&r, offsetof(ParamRecord, checksum))) {
+      applyStoredParams(r.values, r.count, PARAM_SLOTS);
+      return true;
+    }
+  }
+  if (prefs.getBytesLength("prm") == sizeof(ParamRecordOld)) {   // saved by older firmware
+    ParamRecordOld r = {};
+    if (prefs.getBytes("prm", &r, sizeof(r)) == sizeof(r) && r.magic == PRM_MAGIC &&
+        r.version == STORAGE_VERSION &&
+        r.checksum == checksum32(&r, offsetof(ParamRecordOld, checksum))) {
+      applyStoredParams(r.values, r.count, 32);
+      return true;
+    }
+  }
+  return false;
 }
 
 bool saveParams() {
@@ -631,7 +674,7 @@ bool saveParams() {
   r.count = PARAM_COUNT;
   for (int i = 0; i <= PARAM_COUNT; ++i) r.values[i] = params[i];
   r.checksum = checksum32(&r, offsetof(ParamRecord, checksum));
-  return prefs.putBytes("prm", &r, sizeof(r)) == sizeof(r);
+  return prefs.putBytes("prm64", &r, sizeof(r)) == sizeof(r);
 }
 
 bool loadRoute() {
@@ -691,7 +734,7 @@ bool calibrationDataValid(const CalibrationRecord &r) {
     return false;
   for (int s = 0; s < 8; ++s) {
     if (r.white[s] > 4095 || r.black[s] > 4095) return false;
-    if ((int)r.black[s] - (int)r.white[s] < MIN_CAL_RANGE) return false;
+    if (channelOn(s) && (int)r.black[s] - (int)r.white[s] < MIN_CAL_RANGE) return false;
   }
   return true;
 }
@@ -748,6 +791,21 @@ int readRaw(int pin) {
 // Calibration (white/black) stays stored per physical channel.
 int qtrChannel(int s) { return params[P_SENSOR_FLIP] ? 7 - s : s; }
 
+// Sensors switched off in the app (broken) always read white and are
+// ignored by position, PID, junctions, inversion and calibration checks.
+bool sensorOn(int s) { return (params[P_SENSOR_OFF] & (1 << s)) == 0; }
+bool channelOn(int ch) { return sensorOn(qtrChannel(ch)); }   // qtrChannel is its own inverse
+// First working sensor starting at 'from', moving by 'step' (+1 right, -1 left).
+int workingSensor(int from, int step) {
+  for (int s = from; s >= 0 && s < 8; s += step) if (sensorOn(s)) return s;
+  return constrain(from, 0, 7);
+}
+int workingCount() {
+  int n = 0;
+  for (int s = 0; s < 8; ++s) if (sensorOn(s)) n++;
+  return n;
+}
+
 void driveMotor(int in1, int in2, int pwmPin, int speed) {
   speed = constrain(speed, -255, 255);
   digitalWrite(in1, (speed >= 0) ? HIGH : LOW);
@@ -771,6 +829,8 @@ void setMotors(int left, int right) {
 
 void stopRobot() {
   startPulseActive = false;
+  deadEndArmed = false;
+  deadEndChecking = false;
   straightTestEndMs = 0;
   pivotDir = 0;
   lastEdge = 0;
@@ -830,6 +890,7 @@ void sendSensorFrameIfDue() {
   uint8_t p[16] = {};
   long weighted = 0, total = 0;
   for (int s = 0; s < 8; s++) {
+    if (!sensorOn(s)) continue;        // switched off: shown as 0
     const int ch = qtrChannel(s);
     int raw = readRaw(QTR[ch]);
     int signal = 0;
@@ -1074,7 +1135,7 @@ void readBluetooth() {
         lastUs = micros();
         startPulseAtMs = millis();
         startPulseActive = START_PULSE_MS > 0;
-        if (ruleFlags & (RULE_ROUTE | RULE_JUNCTIONS)) routeReset();
+        if (ruleFlags & RULE_ROUTE) routeReset();
         resetCounters();
         lineInverted = params[P_INVERT_MODE] == 2;
 
@@ -1215,9 +1276,10 @@ bool performCalibration(uint8_t mode) {
 
   bool good = true;
   for (int s = 0; s < 8; ++s) {
-    Serial.printf("D%d white %4d black %4d range %4d\n", s + 1,
-                  newWhite[s], newBlack[s], newBlack[s] - newWhite[s]);
-    if (newBlack[s] - newWhite[s] < MIN_CAL_RANGE) good = false;
+    Serial.printf("D%d white %4d black %4d range %4d%s\n", s + 1,
+                  newWhite[s], newBlack[s], newBlack[s] - newWhite[s],
+                  channelOn(s) ? "" : "  (switched off)");
+    if (channelOn(s) && newBlack[s] - newWhite[s] < MIN_CAL_RANGE) good = false;
   }
 
   if (good) {
@@ -1393,6 +1455,8 @@ void routeBackToFollow() {
 }
 
 void routeStartTurn(int8_t dir, bool uturn) {
+  deadEndArmed = false;
+  deadEndChecking = false;
   if (!uturn) robotEvent(dir < 0 ? EV_LEFT_TURN : EV_RIGHT_TURN);
   turnDir = dir;
   turnIsUTurn = uturn;
@@ -1447,31 +1511,15 @@ void routeNextStep(bool straightAhead) {
   }
 }
 
-// Route OFF + "Decide at junctions": pick a path by the preference setting.
-void junctionAutoChoice(uint8_t type, bool straight) {
-  if (type == JT_BOX) { routeBackToFollow(); return; }
-  const bool hasL = type == JT_LEFT_BRANCH || type == JT_T || type == JT_CROSS;
-  const bool hasR = type == JT_RIGHT_BRANCH || type == JT_T || type == JT_CROSS;
-  int8_t dir;   // -1 left, 0 straight, +1 right
-  switch (params[P_JUNCTION_PREFER]) {
-    case 0:  dir = straight ? 0 : (hasL ? -1 : 1); break;   // straight, else left
-    case 1:  dir = straight ? 0 : (hasR ? 1 : -1); break;   // straight, else right
-    case 2:  dir = hasL ? -1 : (straight ? 0 : 1); break;   // left first
-    default: dir = hasR ? 1 : (straight ? 0 : -1); break;   // right first
-  }
-  Serial.printf("Junction choice: %s\n", dir < 0 ? "LEFT" : dir > 0 ? "RIGHT" : "STRAIGHT");
-  if (dir == 0) routeBackToFollow();
-  else routeStartTurn(dir, false);
-}
-
 // Returns true when the route engine drives the motors this cycle (PID skipped).
 // Junctions come from the shape detector (updateJunction, run just before).
 bool routeStep(const int *cal, int32_t total) {
   bool d[8];
   for (int s = 0; s < 8; ++s) d[s] = cal[s] > EDGE_THRESHOLD;
   const bool center = d[3] || d[4];
-  const bool leftSide = d[0] && d[1];
-  const bool rightSide = d[6] && d[7];
+  const int l1 = workingSensor(0, 1), r1 = workingSensor(7, -1);
+  const bool leftSide = d[l1] && d[workingSensor(l1 + 1, 1)];
+  const bool rightSide = d[r1] && d[workingSensor(r1 - 1, -1)];
   const uint32_t now = millis();
   const uint32_t inState = now - routeStateMs;
   const int fwd = basePwm();
@@ -1496,8 +1544,7 @@ bool routeStep(const int *cal, int32_t total) {
         return true;
       }
       if (jDoneType != JT_NONE) {       // branch, T, cross or box
-        if (ruleFlags & RULE_ROUTE) routeNextStep(jDoneStraight);   // next programmed step
-        else junctionAutoChoice(jDoneType, jDoneStraight);          // decide by preference
+        routeNextStep(jDoneStraight);   // next programmed step
         return routeState != RS_FOLLOW || !robotOn;
       }
       if (jActive) {
@@ -1552,6 +1599,57 @@ bool routeStep(const int *cal, int32_t total) {
   return false;
 }
 
+// ---------------- Line ends (dead end) ----------------
+// The line disappears while it was near the center (not at an edge, where it
+// is a turn): drive straight for P_DEAD_END_CONFIRM so a small gap is crossed,
+// then, if the line is still gone: U-turn (default), stop, or the next route
+// step. Junction shapes and edge losses (sharp turns) are not dead ends.
+// Returns true when it drives the motors this cycle.
+bool deadEndRule(int32_t weighted, int32_t total) {
+  const uint8_t action = params[P_DEAD_END_ACTION];
+  if (action == 3 || routeState != RS_FOLLOW || pivotDir != 0 || jActive) {
+    deadEndChecking = false;
+    return false;
+  }
+  const uint32_t now = millis();
+  if (total > 0) {
+    lastLinePos = weighted * 1000 / total;
+    // Armed after following a centered line for the settle time (not in the start box).
+    if (abs((int)(lastLinePos - 3500)) <= 1500) {
+      if (deadEndArmMs == 0) deadEndArmMs = now;
+      if (now - deadEndArmMs >= ARM_MS) deadEndArmed = true;
+    } else {
+      deadEndArmMs = 0;
+    }
+    deadEndChecking = false;
+    return false;
+  }
+  deadEndArmMs = 0;
+  if (!deadEndArmed || abs((int)(lastLinePos - 3500)) > 1500) return false;  // lost at an edge
+  if (!deadEndChecking) { deadEndChecking = true; deadEndLostMs = now; }
+  if (now - deadEndLostMs < (uint32_t)params[P_DEAD_END_CONFIRM] * 10U) {
+    setMotors(basePwm(), basePwm());   // straight on: maybe only a gap
+    return true;
+  }
+  deadEndChecking = false;
+  deadEndArmed = false;
+  if (action == 1) {
+    Serial.println("Line ended: stop");
+    stopRobot();
+    BT.write(LINE_ENDED_STOP);
+    sendStatusFrame();
+    return true;
+  }
+  if (action == 2 && (ruleFlags & RULE_ROUTE)) {
+    Serial.println("Line ended: next route step");
+    routeNextStep(false);
+    return true;
+  }
+  Serial.println("Line ended: U-turn");
+  routeStartTurn(1, true);
+  return true;
+}
+
 // ---------------- Events, counters and flags ----------------
 // Every detected event goes through robotEvent(): it updates the counters
 // (sent to the app 8x per second) and sets a flag. Add future conditions at
@@ -1580,10 +1678,25 @@ void resetCounters() {
   resetJunction();
   lastJunctionType = JT_NONE;
   irEdge = 0;
+  sharpIrEdge = 0;
+}
+
+// 0 stopped, 1/2 sharp turn L/R, 3/4 IR turn L/R, 5/6 route turn L/R,
+// 7 crossing a junction, 8 waiting (route), 9 following the line (PID),
+// 10 line disappeared: driving straight to check for a dead end.
+uint8_t activityCode() {
+  if (!robotOn) return 0;
+  if (pivotDir != 0) return pivotSource == SRC_IR ? (pivotDir < 0 ? 3 : 4) : (pivotDir < 0 ? 1 : 2);
+  if (routeState == RS_TURN_FWD || routeState == RS_TURN_LEAVE || routeState == RS_TURN_FIND ||
+      routeState == RS_REVERSE) return turnDir < 0 ? 5 : 6;
+  if (routeState == RS_WAIT) return 8;
+  if (jActive || routeState == RS_JUNCTION) return 7;
+  if (deadEndChecking) return 10;
+  return 9;
 }
 
 void sendCountersFrame() {
-  uint8_t p[12];
+  uint8_t p[14];
   p[0] = (uint8_t)(counters.irLeft & 255);  p[1] = (uint8_t)(counters.irLeft >> 8);
   p[2] = (uint8_t)(counters.irRight & 255); p[3] = (uint8_t)(counters.irRight >> 8);
   p[4] = counters.junctions;
@@ -1594,6 +1707,10 @@ void sendCountersFrame() {
   p[9] = counters.inversions;
   p[10] = lastJunctionType;   // JT_* of the last shape the robot recognised
   p[11] = junctionSeq;        // +1 per recognised shape (app logs each one)
+  p[12] = activityCode();     // what the robot is doing right now
+  p[13] = (lastEdge < 0 ? 1 : 0) | (lastEdge > 0 ? 2 : 0) |      // which way it would turn
+          (irEdge < 0 ? 4 : 0) | (irEdge > 0 ? 8 : 0) |          // if the line is lost now
+          (sharpIrEdge < 0 ? 16 : 0) | (sharpIrEdge > 0 ? 32 : 0);
   sendFramed(PKT_COUNTERS, p, sizeof(p));
 }
 
@@ -1648,6 +1765,7 @@ void updateInversion(const int *cal) {
   }
   int dark = 0, light = 0;
   for (int s = 0; s < 8; ++s) {
+    if (!sensorOn(s)) continue;
     if (cal[s] > EDGE_THRESHOLD) dark++;
     else light++;
   }
@@ -1674,15 +1792,16 @@ void updateInversion(const int *cal) {
 //   center white -> the line ended: 90-degree corner (or T if both sides)
 // A curve moves the line to the edge with the center white, and (with the IR
 // option) a side path also needs the side IR, so curves are not junctions.
-// Route ON : branch / T / cross / box -> next route step; corner -> turn.
-// Route OFF + "Decide at junctions": corner -> turn; choices -> P_JUNCTION_PREFER.
+// Route ON : left T / right T / T / cross / box -> next route step;
+//            90-degree corner -> turns by itself (no step); curves -> PID.
+// Route OFF: junctions are only counted (and shown in the app log).
 
 const char *junctionName(uint8_t t) {
   switch (t) {
     case JT_LEFT_CORNER:  return "left corner";
     case JT_RIGHT_CORNER: return "right corner";
-    case JT_LEFT_BRANCH:  return "left branch + straight";
-    case JT_RIGHT_BRANCH: return "right branch + straight";
+    case JT_LEFT_BRANCH:  return "left T (left + straight)";
+    case JT_RIGHT_BRANCH: return "right T (right + straight)";
     case JT_T:            return "T junction";
     case JT_CROSS:        return "cross (+)";
     case JT_BOX:          return "box / stop zone";
@@ -1720,8 +1839,10 @@ void updateJunction(const int *cal) {
   int dark = 0;
   for (int i = 0; i < 8; ++i) { d[i] = cal[i] > thr; if (d[i]) dark++; }
   const bool center = d[3] || d[4];
-  const bool leftArm = d[0] && d[1] && center;
-  const bool rightArm = d[6] && d[7] && center;
+  const int l1 = workingSensor(0, 1), l2 = workingSensor(l1 + 1, 1);    // outermost working
+  const int r1 = workingSensor(7, -1), r2 = workingSensor(r1 - 1, -1);
+  const bool leftArm = d[l1] && d[l2] && center;
+  const bool rightArm = d[r1] && d[r2] && center;
   const uint8_t confirm = params[P_JUNCTION_CONFIRM];
   const uint32_t now = millis();
 
@@ -1750,14 +1871,14 @@ void updateJunction(const int *cal) {
     // Crossing the side path(s): remember every side that had one.
     jLeft = jLeft || leftArm;
     jRight = jRight || rightArm;
-    if (dark >= 7) { if (jAllDarkSinceMs == 0) jAllDarkSinceMs = now; }
+    if (dark >= max(1, workingCount() - 1)) { if (jAllDarkSinceMs == 0) jAllDarkSinceMs = now; }
     else jAllDarkSinceMs = 0;
     if (!jBoxReported && jAllDarkSinceMs != 0 && now - jAllDarkSinceMs >= BOX_DETECT_MS) {
       jBoxReported = true;             // reported at once, while still inside the box
       reportJunction(JT_BOX, false);
     }
     const bool timedOut = now - jStartMs > JUNCTION_TIMEOUT_MS;
-    const bool sideDark = d[0] || d[7];  // still on the side line
+    const bool sideDark = d[l1] || d[r1];  // still on the side line
     if (sideDark && !timedOut) { jClearCount = 0; return; }
     if (!timedOut && ++jClearCount < confirm) return;
     if (jBoxReported) { resetJunction(); return; }
@@ -1832,7 +1953,7 @@ void startPivot(int8_t dir, uint8_t source) {
 bool edgeTurnRules(const int *cal, int32_t weighted, int32_t total) {
   (void)cal;
   const bool sharpOn = (ruleFlags & RULE_SHARP_TURN) != 0;
-  const bool irOn = (ruleFlags & RULE_IR_TURN) != 0 && (ruleFlags & RULE_JUNCTIONS) == 0;
+  const bool irOn = (ruleFlags & RULE_IR_TURN) != 0;
   const bool leftRose = irLeftRose, rightRose = irRightRose;
   irLeftRose = irRightRose = false;
   if (!sharpOn && !irOn) { pivotDir = 0; return false; }
@@ -1861,6 +1982,7 @@ bool edgeTurnRules(const int *cal, int32_t weighted, int32_t total) {
       pivotDir = 0;
       lastEdge = 0;
       irEdge = 0;
+      sharpIrEdge = 0;
       pidLast = false;   // no derivative kick when PID restarts
       iTerm = 0.0f;
       return false;
@@ -1871,8 +1993,9 @@ bool edgeTurnRules(const int *cal, int32_t weighted, int32_t total) {
     return true;
   }
 
-  const bool leftEdge = seen && pos <= zone;
-  const bool rightEdge = seen && pos >= 7000 - zone;
+  // Edges are measured from the outermost WORKING sensor (one may be off).
+  const bool leftEdge = seen && pos <= (int32_t)workingSensor(0, 1) * 1000 + zone;
+  const bool rightEdge = seen && pos >= (int32_t)workingSensor(7, -1) * 1000 - zone;
   const bool centered = seen && abs((int)(pos - 3500)) < (int)(CENTERED_ERROR * 1000.0f);
 
   // Sharp turn memory: on which edge the line was last seen.
@@ -1880,6 +2003,16 @@ bool edgeTurnRules(const int *cal, int32_t weighted, int32_t total) {
     if (leftEdge) lastEdge = -1;
     else if (rightEdge) lastEdge = 1;
     else if (centered) lastEdge = 0;
+    // Option: a side IR seeing a line also marks that side (the QTR still ends the spin).
+    if (params[P_SHARP_USE_IR]) {
+      if (leftRose && !rightRose) { sharpIrEdge = -1; sharpIrClear = 0; }
+      else if (rightRose && !leftRose) { sharpIrEdge = 1; sharpIrClear = 0; }
+      if (sharpIrEdge != 0 && centered && !irLeftActive && !irRightActive &&
+          ++sharpIrClear >= SHARP_IR_FORGET) sharpIrEdge = 0;   // line went on straight
+      if ((sharpIrEdge < 0 && rightEdge) || (sharpIrEdge > 0 && leftEdge)) sharpIrEdge = 0;
+    } else {
+      sharpIrEdge = 0;
+    }
   }
   // IR memory: which side IR detected last (any detection, however short).
   if (irOn) {
@@ -1892,8 +2025,8 @@ bool edgeTurnRules(const int *cal, int32_t weighted, int32_t total) {
 
   if (irOn && params[P_IR_TRIGGER] == 1 && (leftRose != rightRose)) {
     startPivot(leftRose ? -1 : 1, SRC_IR);       // turn immediately on detection
-  } else if (!seen && sharpOn && lastEdge != 0) {
-    startPivot(lastEdge, SRC_SHARP);
+  } else if (!seen && sharpOn && (lastEdge != 0 || sharpIrEdge != 0)) {
+    startPivot(lastEdge != 0 ? lastEdge : sharpIrEdge, SRC_SHARP);   // QTR edge first, else IR
   } else if (!seen && irOn && irEdge != 0) {
     startPivot(irEdge, SRC_IR);
   } else {
@@ -1978,6 +2111,7 @@ void loop() {
   int calibrated[8];
   int32_t weighted = 0, total = 0;
   for (int s = 0; s < 8; ++s) {
+    if (!sensorOn(s)) { calibrated[s] = 0; continue; }   // switched off in the app
     const int ch = qtrChannel(s);       // s = 0 is the robot's left side
     int raw = readRaw(QTR[ch]);
     int32_t span = black[ch] - white[ch]; // >= MIN_CAL_RANGE if calOk
@@ -1993,14 +2127,17 @@ void loop() {
   updateInversion(calibrated);
   updateLineEvents(calibrated, total);
 
-  const bool routeOn = (ruleFlags & RULE_ROUTE) != 0;
-  const bool junctionsOn = (ruleFlags & RULE_JUNCTIONS) != 0;
-  if (routeOn || (junctionsOn && pivotDir == 0)) {
-    if (routeStep(calibrated, total)) return;   // junction / route engine drives this cycle
+  if (ruleFlags & RULE_ROUTE) {
+    if (routeStep(calibrated, total)) return;   // route engine drives this cycle
     if (!robotOn) return;                       // route finished or stopped
-  }
-  if (!routeOn && edgeTurnRules(calibrated, weighted, total)) {
-    return;                                     // pivoting this cycle
+    if (deadEndRule(weighted, total)) return;   // line ended
+  } else {
+    if (routeState != RS_FOLLOW && routeState != RS_JUNCTION) {
+      if (routeStep(calibrated, total)) return; // U-turn after a dead end
+      if (!robotOn) return;
+    }
+    if (edgeTurnRules(calibrated, weighted, total)) return;   // sharp / IR turn
+    if (deadEndRule(weighted, total)) return;                 // line ended
   }
 
   float error;
