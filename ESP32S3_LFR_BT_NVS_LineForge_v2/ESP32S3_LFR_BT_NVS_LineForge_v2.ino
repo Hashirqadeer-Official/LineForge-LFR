@@ -55,7 +55,7 @@
     [26,0] send all settings (frame type 54)      [27,0] reset counters
     [28,s] wheel-balance test: drive straight at base speed for s seconds (1..10), no PID
     Type 54: settings, one byte per setting id 1..PARAM_COUNT.
-    Type 55: counters (14 bytes): IR-L count u16, IR-R count u16, junctions, left turns,
+    Type 55: counters (18 bytes; 14..17 = T, left T, right T, cross): IR-L count u16, IR-R count u16, junctions, left turns,
              right turns, gaps, flags (bit0 IR-L sees black, bit1 IR-R,
              bit2 line inverted), inversions.
     [18,value] Sharp-turn spin speed % (10..100)
@@ -163,7 +163,8 @@ const uint8_t P_SENSOR_OFF = 30;        // bit s = QTR sensor S(s+1) switched of
 const uint8_t P_SHARP_USE_IR = 31;      // 1 = side IR detections also tell the sharp turn which side the line went
 const uint8_t P_DEAD_END_ACTION = 32;   // line ends: 0 U-turn, 1 stop, 2 next route step, 3 off
 const uint8_t P_DEAD_END_CONFIRM = 33;  // x10 ms the line must stay gone (drives straight meanwhile)
-const uint8_t PARAM_COUNT = 33;
+const uint8_t P_IR_MEMORY = 34;         // x10 ms: forget an IR side line after the line went on straight this long
+const uint8_t PARAM_COUNT = 34;
 struct ParamDef { uint8_t minV, maxV, def; };
 const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
   {0, 0, 0},       // 0 unused
@@ -197,9 +198,10 @@ const ParamDef PARAM_DEFS[PARAM_COUNT + 1] = {
   {0, 3, 0},       // 28 route OFF choice: straight, else left
   {0, 1, 1},       // 29 IR confirms side paths: on
   {0, 255, 0},     // 30 sensors switched off: none
-  {0, 1, 0},       // 31 sharp turn uses IR: off
+  {0, 1, 1},       // 31 sharp turn uses IR: on
   {0, 3, 0},       // 32 line ends: U-turn
   {1, 50, 5},      // 33 line gone for 50 ms
+  {5, 100, 20},    // 34 IR memory 200 ms
 };
 uint8_t params[PARAM_COUNT + 1];
 uint8_t selectedParam = 0;
@@ -391,8 +393,7 @@ IrFilter irFiltL = {false, false, 0}, irFiltR = {false, false, 0};
 uint32_t irLeftRiseMs = 0, irRightRiseMs = 0;     // when each IR last counted a detection
 int8_t irEdge = 0;                     // -1 = IR-L saw the line last, +1 = IR-R
 int8_t sharpIrEdge = 0;                // sharp turn + IR option: side where an IR saw a line
-uint8_t sharpIrClear = 0;              // centered readings since that IR went white
-const uint8_t SHARP_IR_FORGET = 20;    // forget it after 20 centered readings (100 ms)
+uint32_t sharpIrWhiteMs = 0;           // when both IRs went white again (0 = not yet)
 
 // ---- Inverted line (white line on black) ----
 bool lineInverted = false;
@@ -404,6 +405,7 @@ const uint8_t EV_GAP = 1, EV_JUNCTION = 2, EV_LEFT_TURN = 3, EV_RIGHT_TURN = 4,
 struct RunCounters {
   uint16_t irLeft, irRight;
   uint8_t junctions, leftTurns, rightTurns, gaps, inversions;
+  uint8_t tJunctions, leftTs, rightTs, crosses;   // per junction type
 };
 RunCounters counters = {};
 // Flags: set when the event happens, cleared on START / reset.
@@ -1696,7 +1698,7 @@ uint8_t activityCode() {
 }
 
 void sendCountersFrame() {
-  uint8_t p[14];
+  uint8_t p[18];
   p[0] = (uint8_t)(counters.irLeft & 255);  p[1] = (uint8_t)(counters.irLeft >> 8);
   p[2] = (uint8_t)(counters.irRight & 255); p[3] = (uint8_t)(counters.irRight >> 8);
   p[4] = counters.junctions;
@@ -1711,6 +1713,10 @@ void sendCountersFrame() {
   p[13] = (lastEdge < 0 ? 1 : 0) | (lastEdge > 0 ? 2 : 0) |      // which way it would turn
           (irEdge < 0 ? 4 : 0) | (irEdge > 0 ? 8 : 0) |          // if the line is lost now
           (sharpIrEdge < 0 ? 16 : 0) | (sharpIrEdge > 0 ? 32 : 0);
+  p[14] = counters.tJunctions;
+  p[15] = counters.leftTs;
+  p[16] = counters.rightTs;
+  p[17] = counters.crosses;
   sendFramed(PKT_COUNTERS, p, sizeof(p));
 }
 
@@ -1816,6 +1822,9 @@ void reportJunction(uint8_t type, bool straight) {
   junctionSeq++;
   if (type == JT_LEFT_BRANCH || type == JT_RIGHT_BRANCH || type == JT_T || type == JT_CROSS)
     robotEvent(EV_JUNCTION);
+  uint8_t *c = type == JT_T ? &counters.tJunctions : type == JT_LEFT_BRANCH ? &counters.leftTs
+             : type == JT_RIGHT_BRANCH ? &counters.rightTs : type == JT_CROSS ? &counters.crosses : nullptr;
+  if (c != nullptr && *c < 255) *c = *c + 1;
   Serial.printf("Junction: %s\n", junctionName(type));
 }
 
@@ -1945,15 +1954,15 @@ void startPivot(int8_t dir, uint8_t source) {
 // the line is back within +/- the stop window of the center (spinning left
 // the line enters at S1 and moves right, so stop at position >= 3500 - window).
 //
-// IR turn: IR-R detection -> turn right with both wheels (left forward,
-// right backward); IR-L mirrored. It starts when the line is lost or
-// immediately (setting) and ends the moment the IR detects the line again
-// (same IR, or either IR - setting); then PID continues at once.
+// Side IR (option): IR-R sees a line -> remember "right". When the QTR then
+// loses the line, spin right (IR side has priority over the QTR edge). The
+// spin always ends with the QTR as above, then PID continues. If the QTR
+// keeps seeing the line straight on for P_IR_MEMORY, the IR side is forgotten.
 // Returns true while turning (PID skipped this cycle).
 bool edgeTurnRules(const int *cal, int32_t weighted, int32_t total) {
   (void)cal;
   const bool sharpOn = (ruleFlags & RULE_SHARP_TURN) != 0;
-  const bool irOn = (ruleFlags & RULE_IR_TURN) != 0;
+  const bool irOn = false;   // separate IR turn rule removed: the IR now only guides the sharp turn
   const bool leftRose = irLeftRose, rightRose = irRightRose;
   irLeftRose = irRightRose = false;
   if (!sharpOn && !irOn) { pivotDir = 0; return false; }
@@ -2005,10 +2014,17 @@ bool edgeTurnRules(const int *cal, int32_t weighted, int32_t total) {
     else if (centered) lastEdge = 0;
     // Option: a side IR seeing a line also marks that side (the QTR still ends the spin).
     if (params[P_SHARP_USE_IR]) {
-      if (leftRose && !rightRose) { sharpIrEdge = -1; sharpIrClear = 0; }
-      else if (rightRose && !leftRose) { sharpIrEdge = 1; sharpIrClear = 0; }
-      if (sharpIrEdge != 0 && centered && !irLeftActive && !irRightActive &&
-          ++sharpIrClear >= SHARP_IR_FORGET) sharpIrEdge = 0;   // line went on straight
+      const uint32_t nowMs = millis();
+      if (leftRose && !rightRose) { sharpIrEdge = -1; sharpIrWhiteMs = 0; }
+      else if (rightRose && !leftRose) { sharpIrEdge = 1; sharpIrWhiteMs = 0; }
+      if (irLeftActive || irRightActive) {
+        sharpIrWhiteMs = 0;
+      } else if (sharpIrEdge != 0 && seen) {
+        // The QTR still sees the line after the IR went white: it was a
+        // side line next to a straight path; forget it after IR memory.
+        if (sharpIrWhiteMs == 0) sharpIrWhiteMs = nowMs;
+        if (nowMs - sharpIrWhiteMs >= (uint32_t)params[P_IR_MEMORY] * 10U) sharpIrEdge = 0;
+      }
       if ((sharpIrEdge < 0 && rightEdge) || (sharpIrEdge > 0 && leftEdge)) sharpIrEdge = 0;
     } else {
       sharpIrEdge = 0;
@@ -2026,12 +2042,12 @@ bool edgeTurnRules(const int *cal, int32_t weighted, int32_t total) {
   if (irOn && params[P_IR_TRIGGER] == 1 && (leftRose != rightRose)) {
     startPivot(leftRose ? -1 : 1, SRC_IR);       // turn immediately on detection
   } else if (!seen && sharpOn && (lastEdge != 0 || sharpIrEdge != 0)) {
-    startPivot(lastEdge != 0 ? lastEdge : sharpIrEdge, SRC_SHARP);   // QTR edge first, else IR
+    startPivot(sharpIrEdge != 0 ? sharpIrEdge : lastEdge, SRC_SHARP);   // IR side first, else QTR edge
   } else if (!seen && irOn && irEdge != 0) {
     startPivot(irEdge, SRC_IR);
   } else {
     return false;
-  }
+  } 
   pivotLeftLine = !seen;
   const int speedPct = pivotSource == SRC_IR ? params[P_IR_SPEED] : pivotSpeed;
   const int pwm = speedPct * 255 / 100;

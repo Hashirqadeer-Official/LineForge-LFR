@@ -87,12 +87,12 @@ public final class MainActivity extends Activity {
             P_LEFT_TRIM = 20, P_RIGHT_TRIM = 21, P_SENSOR_FLIP = 22, P_MOTOR_SWAP = 23,
             P_JUNCTION_IR = 24, P_LINE_WIDTH = 25, P_IR_STABLE = 26, P_LOOKAHEAD = 27,
             P_JUNCTION_PREFER = 28, P_JUNCTION_USE_IR = 29, P_SENSOR_OFF = 30, P_SHARP_USE_IR = 31,
-            P_DEAD_END_ACTION = 32, P_DEAD_END_CONFIRM = 33, PARAM_COUNT = 33;
+            P_DEAD_END_ACTION = 32, P_DEAD_END_CONFIRM = 33, P_IR_MEMORY = 34, PARAM_COUNT = 34;
     /** App unit (%, ms) = firmware value x scale. */
     private static final int[] PARAM_SCALE = {1, 10, 100, 1, 1, 1, 100, 1, 1, 1, 1, 10, 10, 10, 10, 100, 1, 100, 100, 1, 1, 1,
-            1, 1, 1, 1, 1, 10, 1, 1, 1, 1, 1, 10};
+            1, 1, 1, 1, 1, 10, 1, 1, 1, 1, 1, 10, 10};
     private static final int[] PARAM_DEFAULT = {0, 50, 15, 0, 0, 35, 15, 1, 0, 0, 6, 10, 5, 25, 15, 30, 2, 5, 10, 0, 100, 100,
-            1, 1, 0, 3, 4, 3, 0, 1, 0, 0, 0, 5};
+            1, 1, 0, 3, 4, 3, 0, 1, 0, 1, 0, 5, 20};
     private static final String[] JUNCTION_NAMES = {"none", "left corner", "right corner",
             "left T (left + straight)", "right T (right + straight)", "T junction", "cross (+)", "box / stop zone"};
     // Route actions shared with the firmware (command 21: action << 4 | seconds).
@@ -154,7 +154,7 @@ public final class MainActivity extends Activity {
     private final Stepper[] paramSteppers = new Stepper[PARAM_COUNT + 1];
     private final Segmented[] paramSegs = new Segmented[PARAM_COUNT + 1];
     private LinearLayout invertOptions;
-    private final TextView[] counterViews = new TextView[6];
+    private final TextView[] counterViews = new TextView[10];
     private int lastJunctionSeq = -1;
     private TextView lineModeLabel, irLiveLabel;
     private Stepper pivotSpeedStep;
@@ -979,6 +979,15 @@ public final class MainActivity extends Activity {
             c.addView(line, full());
             if (r == 0) c.addView(gap(8));
         }
+        c.addView(gap(8));
+        String[] jNames = {"T", "Left T", "Right T", "Cross"};
+        LinearLayout jLine = row();
+        for (int k = 0; k < 4; k++) {
+            if (k > 0) jLine.addView(hgap(8));
+            counterViews[6 + k] = addTile(jLine, jNames[k], null);
+            counterViews[6 + k].setText("0");
+        }
+        c.addView(jLine, full());
         c.addView(gap(10));
         lineModeLabel = help("Line: waiting for robot…");
         c.addView(lineModeLabel, full());
@@ -1046,19 +1055,34 @@ public final class MainActivity extends Activity {
 
         // Sharp turn recovery (QTR outer sensors)
         LinearLayout sharp = card();
-        sharpTurnSwitch = optionSwitch("Sharp turn recovery", "QTR line position • 90° turns at speed",
+        sharpTurnSwitch = optionSwitch("Sharp turn recovery", "QTR edge or side IR • 90° turns at speed",
                 (flags & RULE_SHARP_TURN) != 0, sharp);
         sharp.addView(gap(8));
         sharp.addView(help("Line position goes 0 (under S1, far left) → 3500 (center) → 7000 (under S8, far right). "
-                + "If the line was in the left edge zone and then the robot loses it → spin left in place "
+                + "QTR: if the line was in the left edge zone and then the robot loses it → spin left in place "
                 + "(right motor forward, left backward) until the line is back near the center, then PID continues. "
                 + "The right edge mirrors it."));
-        sharp.addView(label("Use IR to detect side lines"));
-        sharp.addView(paramSeg(P_SHARP_USE_IR, new String[]{"Off (QTR only)", "On (QTR + IR)"}).view, full());
+        sharp.addView(label("Use side IR to detect sharp turns"));
+        sharp.addView(paramSeg(P_SHARP_USE_IR, new String[]{"Off (QTR only)", "On (IR + QTR)"}).view, full());
         sharp.addView(gap(6));
-        sharp.addView(help("On: when a side IR sees a line (a turn is coming on that side), the robot remembers "
-                + "that side too. If the line is then lost it spins that way. The QTR edge has priority, and "
-                + "the spin ALWAYS ends with the QTR (line back near the center), never with the IR."));
+        sharp.addView(help("On (right side, left mirrors it):\n"
+                + "1. IR-R sees a line → the robot remembers \"right\".\n"
+                + "2. If the QTR still sees the line straight ahead, it keeps following it (PID); after "
+                + "IR memory it forgets the side line.\n"
+                + "3. If the QTR loses the line → spin RIGHT (the IR side goes before the QTR edge).\n"
+                + "4. The QTR ends the spin (line back near the center), then PID continues."));
+        sharp.addView(gap(8));
+        irLiveLabel = txt("IR-L  ○      IR-R  ○", 13, MUTED, true);
+        sharp.addView(irLiveLabel, full());
+        sharp.addView(gap(12));
+        sharp.addView(paramStepper(P_IR_STABLE, "IR stable time",
+                "The IR must stay black this long to count (and white as long before the next one). "
+                + "Removes flicker so one line = one count. 0 = count every flicker.", 0, 50, "ms", PURPLE).view, full());
+        sharp.addView(gap(12));
+        sharp.addView(paramStepper(P_IR_MEMORY, "IR memory",
+                "How long the IR side is remembered while the QTR still sees the line going straight. "
+                + "Raise if the robot misses turns, lower if it turns at side lines it should pass.",
+                5, 100, "ms", PURPLE).view, full());
         sharp.addView(gap(12));
         pivotSpeedStep = new Stepper("Spin speed", "Motor power while turning in place", 10, 100,
                 preferences.getInt("pivot_speed", 35), "%", MINT, true);
@@ -1077,35 +1101,6 @@ public final class MainActivity extends Activity {
         sharpAdv.addView(paramStepper(P_SHARP_TIMEOUT, "Give up after",
                 "Back to normal PID if the line isn't found", 1, 50, "ms", ORANGE).view, full());
         content.addView(sharp, full());
-        content.addView(gap(12));
-
-        // IR side sensors
-        LinearLayout ir = card();
-        irTurnSwitch = optionSwitch("IR turn rule", "Left / right IR sensors (GPIO 14 / 4)",
-                (flags & RULE_IR_TURN) != 0, ir);
-        ir.addView(gap(8));
-        irLiveLabel = txt("IR-L  ○      IR-R  ○", 13, MUTED, true);
-        ir.addView(irLiveLabel, full());
-        ir.addView(gap(6));
-        ir.addView(help("How it works (right side, left mirrors it):\n"
-                + "1. IR-R sees a line → the robot remembers \"turn right\".\n"
-                + "2. Start turning: when the QTR loses the line, or immediately (setting below).\n"
-                + "3. Turns right with both wheels (left forward, right backward).\n"
-                + "4. The moment the IR sees the line again, PID takes over.\n"
-                + "If Sharp turn recovery is also ON and the QTR saw the line at an edge, the sharp turn "
-                + "goes first. Detections are always counted on the Drive tab."));
-        ir.addView(gap(12));
-        ir.addView(paramStepper(P_IR_STABLE, "Stable time",
-                "The IR must stay black this long to count (and white as long before the next one). "
-                + "Removes flicker so one line = one count. 0 = count every flicker.", 0, 50, "ms", PURPLE).view, full());
-        ir.addView(label("Start turning"));
-        ir.addView(paramSeg(P_IR_TRIGGER, new String[]{"When line is lost", "Immediately"}).view, full());
-        ir.addView(gap(12));
-        ir.addView(paramStepper(P_IR_SPEED, "Turn speed", "Motor power on both wheels while turning",
-                10, 100, "%", MINT).view, full());
-        ir.addView(label("Stop turning (PID starts) when"));
-        ir.addView(paramSeg(P_IR_END_SENSOR, new String[]{"Same IR detects again", "Either IR detects"}).view, full());
-        content.addView(ir, full());
         content.addView(gap(12));
 
         // Line ends (dead end)
@@ -1483,8 +1478,7 @@ public final class MainActivity extends Activity {
         sendBytes(new byte[]{17, (byte)ruleFlags(), 18, (byte)pivotSpeedStep.get()}, true);
         if (log) addEvent("Rules sent: sharp turn " + (sharpTurnSwitch.isChecked() ? "ON" : "OFF")
                 + " (spin " + pivotSpeedStep.get() + "%), keep previous calibration "
-                + (keepOldCalSwitch.isChecked() ? "ON" : "OFF") + ", IR turn "
-                + (irTurnSwitch != null && irTurnSwitch.isChecked() ? "ON" : "OFF") + ", route mode "
+                + (keepOldCalSwitch.isChecked() ? "ON" : "OFF") + ", route mode "
                 + (routeSwitch != null && routeSwitch.isChecked() ? "ON" : "OFF") + ".");
     }
 
@@ -2384,6 +2378,8 @@ public final class MainActivity extends Activity {
                     (payload[2] & 255) | ((payload[3] & 255) << 8),
                     payload[4] & 255, payload[5] & 255, payload[6] & 255, payload[7] & 255};
             for (int i = 0; i < 6; i++) counterViews[i].setText(String.valueOf(v[i]));
+            if (payload.length >= 18)
+                for (int k = 0; k < 4; k++) counterViews[6 + k].setText(String.valueOf(payload[14 + k] & 255));
             if (payload.length >= 14) showActivity(payload[12] & 255, payload[13] & 255);
             if (payload.length >= 12) {
                 int jt = payload[10] & 255, seq = payload[11] & 255;
